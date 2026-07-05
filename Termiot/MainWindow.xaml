@@ -1,0 +1,63 @@
+<Window x:Class="Termiot.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="clr-namespace:Termiot.Ui"
+        Title="Termiot"
+        Width="1100" Height="650"
+        Background="#FF000000"
+        UseLayoutRounding="True">
+  <DockPanel>
+    <Border DockPanel.Dock="Top" Background="#FF222222">
+      <DockPanel>
+        <Button x:Name="SettingsBtn" DockPanel.Dock="Right" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
+        <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" />
+        <StackPanel x:Name="TabStrip" Orientation="Horizontal" />
+      </DockPanel>
+    </Border>
+    <Border x:Name="InputBar" DockPanel.Dock="Bottom" Background="#FF1D1D1D" Padding="8,4,8,6">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <DockPanel Grid.Row="0" Margin="0,0,0,2">
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+            <TextBlock x:Name="LlmCostText" Foreground="#FF999999" FontFamily="Consolas" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0" />
+            <CheckBox x:Name="LlmToggle" Content="LLM autocomplete" Foreground="#FF999999" VerticalAlignment="Center" Checked="LlmToggle_Changed" Unchecked="LlmToggle_Changed" />
+            <CheckBox x:Name="MultiToggle" Content="multi-complete" Foreground="#FF999999" VerticalAlignment="Center" Margin="10,0,0,0" Visibility="Collapsed" Checked="MultiToggle_Changed" Unchecked="MultiToggle_Changed" />
+          </StackPanel>
+          <TextBlock x:Name="CwdLabel" Foreground="#FF6FA8DC" FontFamily="Consolas" FontSize="13" />
+        </DockPanel>
+        <DockPanel Grid.Row="1">
+          <CheckBox x:Name="RawToggle" DockPanel.Dock="Right" Content="raw keys" Foreground="#FF999999" VerticalAlignment="Center" Margin="10,0,0,0" Checked="RawToggle_Changed" Unchecked="RawToggle_Changed" />
+          <Grid x:Name="EditorArea">
+            <TextBlock x:Name="GhostText" Foreground="#FF5F5F5F" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" IsHitTestVisible="False" Panel.ZIndex="1" />
+            <TextBox x:Name="InputBox" Background="Transparent" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" Padding="0" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" TextChanged="InputBox_TextChanged" PreviewKeyDown="InputBox_PreviewKeyDown" />
+          </Grid>
+        </DockPanel>
+        <StackPanel x:Name="SuggestionPanel" Grid.Row="2" Visibility="Collapsed" Margin="0,3,0,0" />
+      </Grid>
+    </Border>
+    <Grid>
+      <ui:TerminalControl x:Name="Term" />
+      <Border x:Name="ResumeOverlay" Visibility="Collapsed" Background="#FF000000">
+        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="700">
+          <TextBlock Text="This shell has terminated. Its output and directory are saved." Foreground="#FFCCCCCC" FontSize="14" HorizontalAlignment="Center" />
+          <TextBlock x:Name="AutoResumeText" Visibility="Collapsed" Foreground="#FF999999" FontFamily="Consolas" FontSize="12" Margin="0,10,0,0" TextWrapping="Wrap" HorizontalAlignment="Center" />
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,12,0,0">
+            <Button x:Name="ResumeBtn" Content="Resume shell" Click="ResumeBtn_Click" Padding="18,6" />
+            <Button x:Name="ResumeNoRunBtn" Content="Resume without running" Visibility="Collapsed" Click="ResumeNoRunBtn_Click" Padding="18,6" Margin="10,0,0,0" />
+          </StackPanel>
+        </StackPanel>
+      </Border>
+      <Border x:Name="SearchBar" Visibility="Collapsed" HorizontalAlignment="Right" VerticalAlignment="Top" Background="#FF2D2D2D" BorderBrush="#FF555555" BorderThickness="1" Margin="0,4,20,0" Padding="6,4">
+        <StackPanel Orientation="Horizontal">
+          <TextBox x:Name="SearchBox" Width="240" Background="#FF1E1E1E" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontFamily="Consolas" FontSize="13" TextChanged="SearchBox_TextChanged" PreviewKeyDown="SearchBox_PreviewKeyDown" />
+          <TextBlock x:Name="SearchCount" Foreground="#FF999999" Margin="8,0,0,0" VerticalAlignment="Center" FontSize="12" />
+          <Button Content="✕" Click="SearchClose_Click" Margin="8,0,0,0" Background="Transparent" Foreground="#FF999999" BorderThickness="0" />
+        </StackPanel>
+      </Border>
+    </Grid>
+  </DockPanel>
+</Window>

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <StartupObject>Termiot.Program</StartupObject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="restart.bat" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

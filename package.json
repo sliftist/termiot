@@ -1,0 +1,18 @@
+{
+    "name": "termiot",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+        "build": "node scripts/dotnet.js build Termiot",
+        "build-claude": "node scripts/dotnet.js build Termiot/Termiot.csproj -o Termiot/bin/claude-check",
+        "restart": "node scripts/restart.js",
+        "kill": "taskkill /IM Termiot.exe /F",
+        "status-claude": "node scripts/status.js",
+        "test-ui-crash-claude": "node scripts/test-ui-crash.js",
+        "test-host-claude": "node scripts/test-host.js",
+        "test-pipe-claude": "node scripts/test-pipe.js",
+        "test-e2e-claude": "node scripts/test-e2e.js",
+        "start": "node scripts/dotnet.js run --project Termiot",
+        "clean": "node scripts/dotnet.js clean Termiot"
+    }
+}
