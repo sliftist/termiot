@@ -175,6 +175,7 @@ public sealed class TerminalControl : FrameworkElement
         {
             return;
         }
+        long renderStart = System.Diagnostics.Stopwatch.GetTimestamp();
         Array.Fill(_pix, unchecked((int)Palette.DefaultBg));
         lock (_screen.Sync)
         {
@@ -219,6 +220,8 @@ public sealed class TerminalControl : FrameworkElement
         }
         _bmp.WritePixels(new Int32Rect(0, 0, _pxWidth, _pxHeight), _pix, _pxWidth * 4, 0);
         InvalidateVisual();
+        _frameCount++;
+        _frameTicks += System.Diagnostics.Stopwatch.GetTimestamp() - renderStart;
         if (!_firstFrameMarked)
         {
             _firstFrameMarked = true;
@@ -227,6 +230,18 @@ public sealed class TerminalControl : FrameworkElement
     }
 
     private bool _firstFrameMarked;
+    private int _frameCount;
+    private long _frameTicks;
+
+    // Painted-frame stats since the last call: count is output-cadence-driven (idle = legitimately 0), AvgMs is what one full-bitmap render actually costs — 1000/AvgMs is the render ceiling.
+    public (int Count, double AvgMs) TakeFrameStats()
+    {
+        int count = _frameCount;
+        double avgMs = count > 0 ? _frameTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / count : 0;
+        _frameCount = 0;
+        _frameTicks = 0;
+        return (count, avgMs);
+    }
 
     private void DrawCursorBar(int row, int col)
     {

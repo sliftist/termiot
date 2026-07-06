@@ -2,53 +2,41 @@
 
 **Download:** https://github.com/sliftist/termiot/releases/latest
 
-A fast, crash-proof terminal for Windows. Every window is its own process and every shell is its own process, connected by named pipes and persisted to disk — so a crashed or closed window resurrects with its tabs, scrollback, and even the text you had typed but not yet run. Windows shutting down? Everything comes back at next login.
+A durable terminal for windows. Remembers your tab state during reboot. Isolates every single internal shell and window in it's own process.
+
+Uses WPF. Reasonable fast and lightweight.
+
+MIT licensed. Fork it and fix it yourself. Stop wasting your time with terminals that refuse to add basic features and make your own.
+
+Bug reports are welcome, feature requests are welcome. Pull requests are unlikely to be merged. This is a personal project to make a terminal that only supports features I want. If you want a feature, clone it and tell Claude to add the feature. There's 90% chance it will be able to 1 shot it.
 
 ![Tabs](pictures/main%20view.png)
 
 ## Features
 
-- One process per window, one process per shell — a crash never takes anything else down, and shells outlive their window long enough to be reclaimed
-- Full session persistence: tabs, scrollback (replayed from the output log), working directories, window positions, and pending input all restore from disk
-- Bitmap-rendered output with a glyph atlas — no per-frame text layout
-- Drag tabs between windows, or drag one to empty space to spawn a new window
-- Tab and command-aware titles (directory + running command), editable per tab, with win32-input-mode and auto-resume indicators
-- Selection, search (`Ctrl+F`), clickable links (Ctrl+Click, wrapped URLs included), and full modifier-distinct key input (`Ctrl+Enter` ≠ `Enter`) via win32-input-mode
-
-### LLM autocomplete
-
+- Basic tab support, search, ctrl+clickable links, shift+enter support in raw mode (for claude linebreaks).
+- ctrl+t opens a tab in the same folder as your current folder.
+    - WindowTerminal refuses to support this for cmd.exe: https://github.com/microsoft/terminal/issues/3158
+- Persists tab states on disk correctly.
+    - You can restore all of the windows and all the tabs on startup if you want, or you can go in and manually tell it to reopen specific windows with all their tabs magically reappearing. 
+    - Everything is on disk, so you can see the state. You can change the state of (some) things, etc.
+- yarn autocomplete support
+    - Stop having to manually type in commands that could be auto-completed. Just fork this repo and tell Claude to add whatever autocomplete support you want. There's no need to spend years and create an entire framework for it. You can have it do exactly what you want it to do today. 
+- Instead of making everything use the same process so everything crashes at once, we use different processes.
+    - 30MB overhead per shell, ~100MB overhead per window. 
+    - As long as you're not running on a toaster and having at least one gigabyte of memory, you're going to be able to run a lot of Windows and even more tabs.
+- CPU rendering
+    - Avoid weekly GPU crashes, closing all your terminal windows.
+    - Frees up GPU memory, so you can run your expensive AI models. Or video games. Or screensaver. Not everyone can afford a 5090...
+- VS Code/Cursor extension faster opening support.
+    - Makes opening console windows for your current workspace very easy. 
+- Optional LLM autocomplete support
 ![LLM autocomplete](pictures/autocomplete.png)
-
-Bring your own OpenRouter key and the input line predicts complete commands from your terminal context (recent output, command history, directory):
-
-- Multi-complete shows several candidates at once; `Tab`/arrows cycle, configurable count (1–100)
-- Trigger phrases (`hey llm`, `ai please`, …) run a natural-language request through the model even with autocomplete off — "Hey AI, what's my largest disk?" becomes the command that answers it
-- Context-aware regular completion too: files in the directory, command history, `yarn` scripts from package.json
-- Live cost and call counter, model picker, and a "show current context" inspector in settings
-
-### Session model
-
-- Shells keep running when a window closes unexpectedly and reattach on restore; deliberately closed windows stay closed
-- A Windows tab in settings lists every window ever recorded (running or not, with its tabs) for one-click resurrection
-- Optional startup entry restores everything that was open at shutdown/logoff
-- Per-shell `AUTORESUME.cmd` re-runs your command on resume
-
-### Integrations
-
-- **Cursor/VS Code**: a bundled extension binds `Ctrl+Shift+C` to open a tab in the workspace folder — routed over a local HTTP endpoint into an already-running window (same monitor preferred), no process spawn at all
-- **Explorer**: "Open in Termiot" on folders, folder backgrounds, and files (per-user registry, no admin)
-- **Start menu** shortcut and default-terminal registration
-- Everything registers through a version-stable launcher bat that every build repoints, so integrations never go stale
-
-### Scripted layouts
-
-Launch parameters target windows and tabs by name — if the tab already exists its command is restarted, otherwise it's created in the right position:
-
-```
-termiot.bat --ensure --window startup --tab "Dev Server" -d "D:\repos\myapp" --cmd "yarn dev" --order 10
-```
-
-Startup scripts built from these converge to the same window, in a consistent tab order, with the highest-order tab focused.
+- Programmatic changing of resume command.
+    - Optional claude hook so that all of your claude windows will resume with the session that you were last running. 
+- Optional resource usage support
+    - You might be surprised what you find...
+![LLM autocomplete](pictures/detailedusage.png)
 
 ## Installing
 

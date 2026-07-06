@@ -34,11 +34,14 @@ public partial class SettingsWindow : Window
         AutoResumeBox.IsChecked = settings.AutoResumeShells;
         WriteLogImmediatelyBox.IsChecked = settings.WriteLogImmediately;
         ReopenOnStartupBox.IsChecked = settings.ReopenOnStartup;
+        ShowTabResourcesBox.IsChecked = settings.ShowTabResources;
+        ShowFpsBox.IsChecked = settings.ShowFps;
         ConfigPathBox.Text = settings.OpenRouterConfigPath;
         ContextTokensBox.Text = settings.LlmContextTokens.ToString();
         LlmTriggerBox.IsChecked = settings.LlmTriggerEnabled;
         LlmTriggerPhrasesBox.Text = settings.LlmTriggerPhrases;
         MultiCountBox.Text = settings.MultiCompleteCount.ToString();
+        ScrollbackBox.Text = settings.ScrollbackLines.ToString();
         BuildTimeText.Text = BuildInfo.Display;
         _modelBox = new AutoCompleteBox { Text = settings.LlmModel };
         _modelBox.Committed += model =>
@@ -50,6 +53,7 @@ public partial class SettingsWindow : Window
         FocusSelectAll.Attach(ConfigPathBox);
         FocusSelectAll.Attach(ContextTokensBox);
         FocusSelectAll.Attach(LlmTriggerPhrasesBox);
+        FocusSelectAll.Attach(ScrollbackBox);
         _loaded = true;
         // Stock WPF never defocuses a TextBox when blank space is clicked (panels aren't focusable), so do it by hand: any unhandled click lands here and clears keyboard focus.
         MouseDown += (_, _) => Keyboard.ClearFocus();
@@ -66,12 +70,14 @@ public partial class SettingsWindow : Window
             RefreshCursorExec();
             RefreshStartMenu();
             RefreshContextMenu();
+            RefreshClaudeHook();
         };
         RefreshWindowList();
         RefreshDefaultTerminal();
         RefreshCursorExec();
         RefreshStartMenu();
         RefreshContextMenu();
+        RefreshClaudeHook();
         _refreshTimer.Start();
         Closed += (_, _) =>
         {
@@ -99,6 +105,23 @@ public partial class SettingsWindow : Window
         }
         _settings.AutoResumeShells = AutoResumeBox.IsChecked.GetValueOrDefault();
         _settings.Save();
+    }
+
+    private const int MinScrollbackLines = 100;
+    private const int MaxScrollbackLines = 10_000_000;
+
+    private void ScrollbackBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+        if (int.TryParse(ScrollbackBox.Text.Trim(), out int lines) && lines >= MinScrollbackLines && lines <= MaxScrollbackLines)
+        {
+            _settings.ScrollbackLines = lines;
+            _settings.Save();
+            _onChanged();
+        }
     }
 
     private void LlmTriggerBox_Changed(object sender, RoutedEventArgs e)
@@ -144,6 +167,28 @@ public partial class SettingsWindow : Window
         }
         _settings.WriteLogImmediately = WriteLogImmediatelyBox.IsChecked.GetValueOrDefault();
         _settings.Save();
+    }
+
+    private void ShowTabResourcesBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+        _settings.ShowTabResources = ShowTabResourcesBox.IsChecked.GetValueOrDefault();
+        _settings.Save();
+        _onChanged();
+    }
+
+    private void ShowFpsBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+        _settings.ShowFps = ShowFpsBox.IsChecked.GetValueOrDefault();
+        _settings.Save();
+        _onChanged();
     }
 
     private static string StartupBatPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Termiot-reopen.bat");
@@ -374,6 +419,33 @@ public partial class SettingsWindow : Window
             AppLog.Write("explorer", "context menu removal failed: " + ex);
         }
         RefreshContextMenu();
+    }
+
+    private void RefreshClaudeHook()
+    {
+        if (!ClaudeIntegration.ClaudeInstalled)
+        {
+            ClaudeHookStatus.Text = "(Claude Code not found — no ~\\.claude directory)";
+            ClaudeHookBtn.IsEnabled = false;
+            return;
+        }
+        bool installed = ClaudeIntegration.IsInstalled;
+        ClaudeHookStatus.Text = installed ? ClaudeIntegration.HookPath : "(hook not installed)";
+        ClaudeHookBtn.IsEnabled = !installed;
+        ClaudeHookBtn.Content = installed ? "✓ Auto-resume hook added to Claude Code" : "Add auto-resume hook to Claude Code";
+    }
+
+    private void ClaudeHookBtn_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            ClaudeIntegration.Install();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("claude", "hook install failed: " + ex);
+        }
+        RefreshClaudeHook();
     }
 
     private void RefreshStartMenu()

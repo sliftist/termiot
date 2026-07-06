@@ -41,6 +41,7 @@ public partial class MainWindow : Window
         public bool LoggedFirstRender;
         public string PendingInput = "";
         public string LastCommand = "";
+        public CommandHistory History = null!;
         public bool Running;
         // (command, absolute line index) pairs from termiot-cmd markers; guarded by Screen.Sync (appended during parsing, read for LLM context).
         public List<(string Cmd, int Line)> CommandMarks = new();
@@ -52,11 +53,14 @@ public partial class MainWindow : Window
         public TextBlock AutoResumeButton = null!;
         public TextBlock RevertTitleButton = null!;
         public TextBlock Win32Badge = null!;
+        public StackPanel ResourceRow = null!;
+        // Index order: VRAM, CPU, memory.
+        public TextBlock[] ResourceTexts = null!;
+        public System.Windows.Shapes.Rectangle[] ResourceBars = null!;
     }
 
     private readonly string _windowId;
     private readonly AppSettings _settings;
-    private readonly CommandHistory _history;
     private readonly List<TabVm> _tabs = new();
     private int _active = -1;
     private SettingsWindow? _settingsWindow;
@@ -71,6 +75,7 @@ public partial class MainWindow : Window
     private long _yarnNamesTick;
     private List<string> _yarnNames = new();
     private readonly LlmPredictor _predictor;
+    private readonly ResourceSampler _resources = new();
     private readonly DispatcherTimer _llmTimer;
     private readonly List<TextBlock> _suggestionRows = new();
     // The unified suggestion list shown under the input: LLM predictions when the LLM toggle is on, otherwise the regular candidates (history, yarn, filesystem). Tab walks _candIndex through the whole list; _candWindowStart is the rolling display window.
@@ -112,7 +117,6 @@ public partial class MainWindow : Window
         InitializeComponent();
         StartupTrace.Mark("init-component");
         _settings = AppSettings.Load();
-        _history = new CommandHistory();
         StartupTrace.Mark("settings+history");
         // Explicit launches (e.g. Cursor's Ctrl+Shift+C) take focus — the user asked for a terminal. Everything else (restores, respawns) surfaces via the topmost flip without stealing focus.
         ShowActivated = takeFocus;
@@ -177,7 +181,20 @@ public partial class MainWindow : Window
             RequestLlmPrediction();
         };
         BuildTimeText.Text = BuildInfo.Display;
+        ReloadBtn.Visibility = BuildInfo.HasSource ? Visibility.Visible : Visibility.Collapsed;
         WindowNameBox.Text = state.Name;
+        FpsText.Visibility = _settings.ShowFps ? Visibility.Visible : Visibility.Collapsed;
+        var statsTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        statsTimer.Tick += (_, _) =>
+        {
+            if (_settings.ShowFps)
+            {
+                var (count, avgMs) = Term.TakeFrameStats();
+                FpsText.Text = count > 0 ? $"{count} fps · {avgMs:0.0}ms ≈{Math.Min(9999, 1000 / Math.Max(0.01, avgMs)):0} cap" : "0 fps";
+            }
+            UpdateResourceRows();
+        };
+        statsTimer.Start();
         LlmToggle.IsChecked = _settings.LlmEnabled;
         MultiToggle.IsChecked = _settings.LlmMultiComplete;
         RawToggle.IsChecked = _settings.RawInput;
@@ -286,9 +303,9 @@ public partial class MainWindow : Window
 
     private TabVm CreateTab(TabInfo info, bool activate, bool start = true, bool insertAfterActive = false, int insertIndex = -1)
     {
-        var screen = new TermScreen(120, 30);
+        var screen = new TermScreen(120, 30) { ScrollbackCap = _settings.ScrollbackLines };
         var parser = new VtParser(screen) { ShowEscapes = _settings.ShowEscapeSequences };
-        var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput };
+        var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput, History = new CommandHistory(AppPaths.ShellHistoryFile(info.Id)) };
         parser.OnTitle = title => Dispatcher.BeginInvoke(() =>
         {
             title = title.Trim();
@@ -546,6 +563,80 @@ public partial class MainWindow : Window
         CreateTab(new TabInfo { Id = shellId, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle }, activate: true, insertIndex: insertIndex);
     }
 
+    private const double ResourceCellWidth = 56;
+    // Index order everywhere in the row: VRAM, CPU, memory.
+    private static readonly Color[] ResourceBarColors = { Color.FromRgb(0x2E, 0x5B, 0x3A), Color.FromRgb(0x6B, 0x4A, 0x2E), Color.FromRgb(0x2E, 0x4A, 0x6B) };
+    private static readonly string[] ResourceTips = { "V: dedicated GPU memory", "C: CPU, averaged over the last minute", "M: memory (working set of the tab's process tree)" };
+
+    // One mini bar-gauge per metric: the text sits over a rectangle whose width is the tab's share of the window's per-metric maximum, so the heaviest tab reads at a glance.
+    private void BuildResourceRow(TabVm vm)
+    {
+        vm.ResourceRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 3), Visibility = _settings.ShowTabResources ? Visibility.Visible : Visibility.Collapsed };
+        vm.ResourceTexts = new TextBlock[3];
+        vm.ResourceBars = new System.Windows.Shapes.Rectangle[3];
+        for (int i = 0; i < 3; i++)
+        {
+            var bar = new System.Windows.Shapes.Rectangle
+            {
+                Fill = new SolidColorBrush(ResourceBarColors[i]),
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Width = 0,
+            };
+            var label = new TextBlock
+            {
+                Foreground = new SolidColorBrush(Color.FromRgb(0xAA, 0xAA, 0xAA)),
+                FontSize = 10,
+                Margin = new Thickness(3, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            var cell = new Grid { Width = ResourceCellWidth, Height = 13, Margin = new Thickness(0, 0, 2, 0), Background = new SolidColorBrush(Color.FromRgb(0x1A, 0x1A, 0x1A)), ToolTip = ResourceTips[i] };
+            cell.Children.Add(bar);
+            cell.Children.Add(label);
+            vm.ResourceBars[i] = bar;
+            vm.ResourceTexts[i] = label;
+            vm.ResourceRow.Children.Add(cell);
+        }
+    }
+
+    private void UpdateResourceRows()
+    {
+        _resources.SetShells(_tabs.Select(t => t.Info.Id));
+        if (!_settings.ShowTabResources || _tabs.Count == 0)
+        {
+            return;
+        }
+        var usages = _tabs.Select(t => _resources.Get(t.Info.Id)).ToList();
+        double maxMem = Math.Max(1, usages.Max(u => (double?)(u?.MemoryBytes ?? 0) ?? 0));
+        double maxGpu = Math.Max(1, usages.Max(u => (double?)(u?.GpuBytes ?? 0) ?? 0));
+        double maxCpu = Math.Max(1, usages.Max(u => u?.CpuPercent ?? 0));
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            var vm = _tabs[i];
+            var usage = usages[i];
+            if (usage == null)
+            {
+                vm.ResourceTexts[0].Text = vm.ResourceTexts[1].Text = vm.ResourceTexts[2].Text = "—";
+                vm.ResourceBars[0].Width = vm.ResourceBars[1].Width = vm.ResourceBars[2].Width = 0;
+                continue;
+            }
+            vm.ResourceTexts[0].Text = "V " + FmtBytes(usage.GpuBytes);
+            vm.ResourceTexts[1].Text = $"C {usage.CpuPercent:0}%";
+            vm.ResourceTexts[2].Text = "M " + FmtBytes(usage.MemoryBytes);
+            vm.ResourceBars[0].Width = usage.GpuBytes / maxGpu * ResourceCellWidth;
+            vm.ResourceBars[1].Width = usage.CpuPercent / maxCpu * ResourceCellWidth;
+            vm.ResourceBars[2].Width = usage.MemoryBytes / maxMem * ResourceCellWidth;
+        }
+    }
+
+    private static string FmtBytes(long bytes)
+    {
+        if (bytes >= 1_000_000_000)
+        {
+            return $"{bytes / 1_000_000_000.0:0.0}G";
+        }
+        return $"{bytes / 1_000_000.0:0}M";
+    }
+
     private void BuildTabHeader(TabVm vm)
     {
         var text = new TextBlock
@@ -661,9 +752,13 @@ public partial class MainWindow : Window
         panel.Children.Add(autoRun);
         panel.Children.Add(refresh);
         panel.Children.Add(close);
+        BuildResourceRow(vm);
+        var headerStack = new StackPanel();
+        headerStack.Children.Add(vm.ResourceRow);
+        headerStack.Children.Add(panel);
         var border = new Border
         {
-            Child = panel,
+            Child = headerStack,
             Padding = new Thickness(12, 6, 10, 6),
             Cursor = Cursors.Hand,
             Background = Brushes.Transparent,
@@ -1686,7 +1781,7 @@ public partial class MainWindow : Window
                         session.SendCommandMarker(text.Trim());
                     }
                     session.SendText(text + "\r");
-                    _history.Add(text);
+                    vm.History.Add(text);
                     if (text.Trim().Length > 0)
                     {
                         vm.LastCommand = text.Trim();
@@ -1725,7 +1820,7 @@ public partial class MainWindow : Window
                 }
                 else
                 {
-                    _histEntries = _history.Match("");
+                    _histEntries = Active?.History.Match("") ?? new List<string>();
                     if (_histEntries.Count > 0)
                     {
                         var stash = InputBox.Text;
@@ -1970,9 +2065,9 @@ public partial class MainWindow : Window
     {
         var result = new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (text.Length > 0)
+        if (text.Length > 0 && Active is { } activeVm)
         {
-            foreach (var entry in _history.Match(text))
+            foreach (var entry in activeVm.History.Match(text))
             {
                 if (!string.Equals(entry, text, StringComparison.OrdinalIgnoreCase) && seen.Add(entry))
                 {
@@ -2301,6 +2396,12 @@ public partial class MainWindow : Window
     private void ApplySettings()
     {
         ApplyLlmUi();
+        FpsText.Visibility = _settings.ShowFps ? Visibility.Visible : Visibility.Collapsed;
+        foreach (var tab in _tabs)
+        {
+            tab.Screen.ScrollbackCap = _settings.ScrollbackLines;
+            tab.ResourceRow.Visibility = _settings.ShowTabResources ? Visibility.Visible : Visibility.Collapsed;
+        }
     }
 
     private void CenterOverWindow(IntPtr reference)

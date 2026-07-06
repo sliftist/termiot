@@ -12,7 +12,6 @@ public static class LastActiveWindow
     public static readonly IntPtr EnsureShellMessageId = (IntPtr)0x7E541073;
     private const int WM_COPYDATA = 0x004A;
     private const int SendTimeoutMs = 3000;
-    private const uint MONITOR_DEFAULTTONEAREST = 2;
 
     public sealed class Record
     {
@@ -83,8 +82,7 @@ public static class LastActiveWindow
     public static bool TryOpenTab(string cwd)
     {
         var reference = GetForegroundWindow();
-        var referenceMonitor = reference != IntPtr.Zero ? MonitorFromWindow(reference, MONITOR_DEFAULTTONEAREST) : IntPtr.Zero;
-        foreach (var record in AliveRecordsPreferring(referenceMonitor))
+        foreach (var record in AliveRecordsPreferring(reference))
         {
             if (SendCopyData(new IntPtr(record.Hwnd), OpenTabMessageId, cwd))
             {
@@ -99,7 +97,10 @@ public static class LastActiveWindow
         return SendCopyData(new IntPtr(record.Hwnd), EnsureShellMessageId, shellId);
     }
 
-    private static List<Record> AliveRecordsPreferring(IntPtr monitor)
+    // "Same screen" can't come from monitor handles — spanning setups (NVIDIA Surround) merge every panel into one logical monitor. Instead a window whose rect substantially overlaps the reference window's horizontal span (i.e. sits above/below it) is treated as on the same physical screen; without such a window, plain recency wins.
+    private const double SameColumnMinOverlap = 0.5;
+
+    private static List<Record> AliveRecordsPreferring(IntPtr reference)
     {
         var alive = new List<Record>();
         try
@@ -126,10 +127,22 @@ public static class LastActiveWindow
         {
             AppLog.Write("ui", "active-window scan failed: " + ex.Message);
         }
+        bool haveReference = reference != IntPtr.Zero && GetWindowRect(reference, out var refRect) && refRect.Right > refRect.Left;
         return alive
-            .OrderByDescending(r => monitor != IntPtr.Zero && MonitorFromWindow(new IntPtr(r.Hwnd), MONITOR_DEFAULTTONEAREST) == monitor)
+            .OrderByDescending(r => haveReference && SharesColumn(reference, new IntPtr(r.Hwnd)))
             .ThenByDescending(r => r.LastActiveTicks)
             .ToList();
+    }
+
+    private static bool SharesColumn(IntPtr reference, IntPtr candidate)
+    {
+        if (!GetWindowRect(reference, out var a) || !GetWindowRect(candidate, out var b))
+        {
+            return false;
+        }
+        double overlap = Math.Min(a.Right, b.Right) - Math.Max(a.Left, b.Left);
+        double narrower = Math.Min(a.Right - a.Left, b.Right - b.Left);
+        return narrower > 0 && overlap / narrower >= SameColumnMinOverlap;
     }
 
     private static bool SendCopyData(IntPtr hwnd, IntPtr messageId, string payload)
@@ -174,8 +187,17 @@ public static class LastActiveWindow
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [DllImport("user32.dll")]
-    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr SendMessageTimeout(IntPtr hWnd, int msg, IntPtr wParam, ref COPYDATASTRUCT lParam, uint flags, uint timeoutMs, out IntPtr result);

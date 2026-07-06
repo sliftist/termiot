@@ -32,12 +32,30 @@
           <TextBlock Text="Multi-complete suggestions (1-100):" Foreground="#FFDDDDDD" VerticalAlignment="Center" />
           <TextBox x:Name="MultiCountBox" Width="60" Margin="8,0,0,0" Background="#FF1E1E1E" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderBrush="#FF555555" FontFamily="Consolas" TextChanged="MultiCountBox_TextChanged" />
         </StackPanel>
+        <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+          <TextBlock Text="Scrollback history (lines):" Foreground="#FFDDDDDD" VerticalAlignment="Center" />
+          <TextBox x:Name="ScrollbackBox" Width="100" Margin="8,0,0,0" Background="#FF1E1E1E" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderBrush="#FF555555" FontFamily="Consolas" TextChanged="ScrollbackBox_TextChanged" />
+        </StackPanel>
         <CheckBox x:Name="WriteLogImmediatelyBox"
                   Foreground="#FFDDDDDD"
                   Margin="0,10,0,0"
                   Checked="WriteLogImmediatelyBox_Changed"
                   Unchecked="WriteLogImmediatelyBox_Changed">
           <TextBlock Text="Write shell output to disk immediately (default: batched once per second; applies to newly started shells)" />
+        </CheckBox>
+        <CheckBox x:Name="ShowTabResourcesBox"
+                  Foreground="#FFDDDDDD"
+                  Margin="0,10,0,0"
+                  Checked="ShowTabResourcesBox_Changed"
+                  Unchecked="ShowTabResourcesBox_Changed">
+          <TextBlock Text="Show per-tab resource usage above tab titles (memory / dedicated GPU memory / CPU over the last minute, bars scaled to the window's heaviest tab)" />
+        </CheckBox>
+        <CheckBox x:Name="ShowFpsBox"
+                  Foreground="#FFDDDDDD"
+                  Margin="0,10,0,0"
+                  Checked="ShowFpsBox_Changed"
+                  Unchecked="ShowFpsBox_Changed">
+          <TextBlock Text="Show render FPS in the title bar (painted frames · per-frame cost · sustainable ceiling)" />
         </CheckBox>
         <CheckBox x:Name="ReopenOnStartupBox"
                   Foreground="#FFDDDDDD"
@@ -66,6 +84,10 @@
           <Button x:Name="ContextMenuBtn" Content="Add 'Open in Termiot' to Explorer" Padding="10,4" Click="ContextMenuBtn_Click" />
           <Button x:Name="ContextMenuRemoveBtn" Content="Remove" Padding="10,4" Margin="8,0,0,0" Click="ContextMenuRemoveBtn_Click" />
         </StackPanel>
+        <TextBlock Text="Claude Code:" Foreground="#FFAAAAAA" Margin="0,16,0,0" />
+        <TextBlock x:Name="ClaudeHookStatus" Foreground="#FFCCCCCC" FontFamily="Consolas" FontSize="12" Margin="0,4,0,0" />
+        <Button x:Name="ClaudeHookBtn" Content="Add auto-resume hook to Claude Code" Padding="10,4" Margin="0,6,0,0" HorizontalAlignment="Left" Click="ClaudeHookBtn_Click" />
+        <TextBlock Text="Writes `claude -r &lt;session&gt;` to the tab's AUTORESUME.cmd whenever a Claude session starts, so restored tabs resume the exact session that was running in them." Foreground="#FF777777" FontSize="11" Margin="0,2,0,0" />
         <TextBlock Text="Start menu:" Foreground="#FFAAAAAA" Margin="0,16,0,0" />
         <TextBlock x:Name="StartMenuStatus" Foreground="#FFCCCCCC" FontFamily="Consolas" FontSize="12" Margin="0,4,0,0" />
         <Button x:Name="StartMenuBtn" Content="Add this executable to the Start menu" Padding="10,4" Margin="0,6,0,0" HorizontalAlignment="Left" Click="StartMenuBtn_Click" />

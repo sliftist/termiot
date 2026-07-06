@@ -3,8 +3,11 @@ namespace Termiot.Terminal;
 // The screen model: a grid of TermLine objects plus an unbounded-ish scrollback. Lines scroll off the top by moving the line object itself into the scrollback list, so annotations and content survive without copying. All mutation and read access must happen under Sync.
 public sealed class TermScreen
 {
-    public const int ScrollbackCap = 1_000_000;
+    public const int DefaultScrollbackCap = 1_000_000;
     private const int ScrollbackTrimChunk = 10_000;
+
+    // Settable at runtime (settings → scrollback history); shrinking takes effect lazily on the next scrolled-off line.
+    public int ScrollbackCap { get; set; } = DefaultScrollbackCap;
     private const int TabWidth = 8;
 
     public readonly object Sync = new();

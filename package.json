@@ -1,8 +1,9 @@
 {
     "name": "termiot",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "private": true,
     "scripts": {
+        "typenode": "typenode",
         "build": "node scripts/build.js",
         "release": "node scripts/publish-release.js",
         "build-claude": "node scripts/dotnet.js build Termiot/Termiot.csproj -o Termiot/bin/claude-check",
@@ -17,5 +18,8 @@
         "test-e2e-claude": "node scripts/test-e2e.js",
         "start": "node scripts/dotnet.js run --project Termiot",
         "clean": "node scripts/dotnet.js clean Termiot"
+    },
+    "devDependencies": {
+        "typenode": "^6.0.1"
     }
 }

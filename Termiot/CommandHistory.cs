@@ -2,23 +2,26 @@ using System.IO;
 
 namespace Termiot;
 
+// Per-shell command history: each tab remembers only what was run in it (file lives in the shell's own folder), so up-arrow and history-based autocomplete never surface other tabs' commands.
 public sealed class CommandHistory
 {
     private const int MaxEntries = 5000;
 
+    private readonly string _file;
     private readonly List<string> _entries = new();
 
-    public CommandHistory()
+    public CommandHistory(string file)
     {
+        _file = file;
         try
         {
-            if (File.Exists(AppPaths.HistoryFile))
+            if (File.Exists(_file))
             {
-                _entries.AddRange(File.ReadAllLines(AppPaths.HistoryFile).Where(l => l.Length > 0));
+                _entries.AddRange(File.ReadAllLines(_file).Where(l => l.Length > 0));
                 if (_entries.Count > MaxEntries)
                 {
                     _entries.RemoveRange(0, _entries.Count - MaxEntries);
-                    File.WriteAllLines(AppPaths.HistoryFile, _entries);
+                    File.WriteAllLines(_file, _entries);
                 }
             }
         }
@@ -37,7 +40,8 @@ public sealed class CommandHistory
         _entries.Add(command);
         try
         {
-            File.AppendAllLines(AppPaths.HistoryFile, new[] { command });
+            Directory.CreateDirectory(Path.GetDirectoryName(_file)!);
+            File.AppendAllLines(_file, new[] { command });
         }
         catch
         {

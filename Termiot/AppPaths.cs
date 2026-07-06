@@ -9,7 +9,6 @@ public static class AppPaths
     public static readonly string ShellsDir = Path.Combine(Root, "shells");
     public static readonly string WindowsDir = Path.Combine(Root, "windows");
     public static readonly string SettingsFile = Path.Combine(Root, "settings.json");
-    public static readonly string HistoryFile = Path.Combine(Root, "history.txt");
     public static readonly string AppLogFile = Path.Combine(Root, "app.log");
     public static readonly string UnhandledEscapesFile = Path.Combine(Root, "unhandled-escapes.md");
 
@@ -26,6 +25,8 @@ public static class AppPaths
     public static string ShellInfoFile(string shellId) => Path.Combine(ShellDir(shellId), "shell.json");
 
     public static string HostInfoFile(string shellId) => Path.Combine(ShellDir(shellId), "host.json");
+
+    public static string ShellHistoryFile(string shellId) => Path.Combine(ShellDir(shellId), "history.txt");
 
     // Optional, user-authored: a batch script executed (by sending its path to the shell) when the shell is resumed. The shell's SHELLFOLDER env var points at its folder so scripts can find it.
     public static string AutoResumeFile(string shellId) => Path.Combine(ShellDir(shellId), "AUTORESUME.cmd");
