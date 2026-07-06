@@ -10,6 +10,10 @@ public sealed class TabInfo
     public string Cwd { get; set; } = "";
     public string Title { get; set; } = "cmd";
     public string ForcedTitle { get; set; } = "";
+    // Typed-but-unsent input, persisted so reloads/takeovers don't lose it.
+    public string PendingInput { get; set; } = "";
+    // Sort key from --ensure --order: keeps scripted tabs in a consistent position; the highest-order tab wins focus. 0 = unordered (sorts first).
+    public int EnsureOrder { get; set; }
 }
 
 // Per-shell metadata stored inside the shell's own folder (shells\<id>\shell.json), written by the window that watches it.
@@ -19,6 +23,8 @@ public sealed class ShellInfo
     public string Title { get; set; } = "cmd";
     // A user-renamed tab keeps this title permanently (over both the automatic folder+command title and process-set titles) until cleared.
     public string ForcedTitle { get; set; } = "";
+    public string PendingInput { get; set; } = "";
+    public int EnsureOrder { get; set; }
 
     public static ShellInfo? Load(string shellId)
     {
@@ -42,7 +48,7 @@ public sealed class ShellInfo
         try
         {
             Directory.CreateDirectory(AppPaths.ShellDir(info.Id));
-            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle }, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder }, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(AppPaths.ShellInfoFile(info.Id), json);
         }
         catch (Exception ex)
@@ -118,8 +124,13 @@ public sealed class WindowState
     public double? Y { get; set; }
     public double? Width { get; set; }
     public double? Height { get; set; }
+    // User-assigned window name; also the lookup key for --ensure targeted launches.
+    public string Name { get; set; } = "";
     public int OwnerPid { get; set; }
     public long OwnerStartTicks { get; set; }
+    // True only when the user deliberately closed the window (X button). Crashes never write it, and session-ending (shutdown/logoff) closes deliberately leave it false — both cases reopen on the next launch.
+    public bool ClosedCleanly { get; set; }
+    public long ClosedAtTicks { get; set; }
 
     public static WindowState Load(string windowId)
     {
@@ -171,7 +182,7 @@ public sealed class WindowState
                 continue;
             }
             var info = ShellInfo.Load(id) ?? new ShellInfo();
-            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle });
+            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder });
         }
         return tabs;
     }

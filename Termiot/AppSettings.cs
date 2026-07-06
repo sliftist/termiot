@@ -9,12 +9,15 @@ public sealed class AppSettings
     public bool RawInput { get; set; }
     public bool AutoResumeShells { get; set; }
     public bool WriteLogImmediately { get; set; }
+    public bool ReopenOnStartup { get; set; }
 
     public string OpenRouterConfigPath { get; set; } = "";
     public string LlmModel { get; set; } = "qwen/qwen3-coder-30b-a3b-instruct";
     public int LlmContextTokens { get; set; } = 10000;
     public bool LlmEnabled { get; set; }
     public bool LlmMultiComplete { get; set; }
+    public bool LlmTriggerEnabled { get; set; }
+    public string LlmTriggerPhrases { get; set; } = "Hey llm | llm please | hey ai | ai please";
     public int MultiCompleteCount { get; set; } = 3;
     public double LlmTotalCostUsd { get; set; }
     public long LlmInputTokens { get; set; }

@@ -51,16 +51,18 @@ public partial class MainWindow : Window
         public TextBox TitleEditor = null!;
         public TextBlock AutoResumeButton = null!;
         public TextBlock RevertTitleButton = null!;
+        public TextBlock Win32Badge = null!;
     }
 
     private readonly string _windowId;
-    private readonly AppSettings _settings = AppSettings.Load();
-    private readonly CommandHistory _history = new();
+    private readonly AppSettings _settings;
+    private readonly CommandHistory _history;
     private readonly List<TabVm> _tabs = new();
     private int _active = -1;
     private SettingsWindow? _settingsWindow;
     private readonly DispatcherTimer _saveTimer;
     private readonly DispatcherTimer _renderTimer;
+    private readonly DispatcherTimer _syncTimer;
     private List<(int Line, int Col)> _matches = new();
     private int _matchIndex = -1;
     private const int YarnNamesCacheMs = 5000;
@@ -97,15 +99,40 @@ public partial class MainWindow : Window
     private TabVm? _draggingVm;
     private DragGhost? _dragGhost;
 
-    public MainWindow(string windowId, Termiot.WindowState state, bool forceResume = false)
+    public MainWindow(string windowId, Termiot.WindowState state, bool forceResume = false, bool takeFocus = false)
     {
         _windowId = windowId;
+        StartupTrace.Mark("ctor-start");
+        // Captured before our own window can become foreground: new windows center over whatever the user was focused on when they launched us.
+        var launchForeground = GetForegroundWindow();
         InitializeComponent();
+        StartupTrace.Mark("init-component");
+        _settings = AppSettings.Load();
+        _history = new CommandHistory();
+        StartupTrace.Mark("settings+history");
+        // Explicit launches (e.g. Cursor's Ctrl+Shift+C) take focus — the user asked for a terminal. Everything else (restores, respawns) surfaces via the topmost flip without stealing focus.
+        ShowActivated = takeFocus;
+        Loaded += (_, _) =>
+        {
+            if (takeFocus)
+            {
+                ForceForeground();
+            }
+            else
+            {
+                BringToTopWithoutFocus();
+            }
+        };
         if (state.X is { } x && state.Y is { } y)
         {
             WindowStartupLocation = WindowStartupLocation.Manual;
             Left = x;
             Top = y;
+        }
+        else
+        {
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            SourceInitialized += (_, _) => CenterOverWindow(launchForeground);
         }
         if (state.Width is { } w and > 100 && state.Height is { } h and > 100)
         {
@@ -124,14 +151,14 @@ public partial class MainWindow : Window
         _renderTimer.Tick += (_, _) => RenderDirtyTabs();
         _renderTimer.Start();
         // The window file is the single source of truth for window↔shell ownership; re-reading it periodically picks up shells assigned to this window by other processes even if their handoff message was lost.
-        var syncTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(WindowFileSyncMs) };
-        syncTimer.Tick += (_, _) => SyncTabsFromWindowFile();
-        syncTimer.Start();
+        _syncTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(WindowFileSyncMs) };
+        _syncTimer.Tick += (_, _) => SyncTabsFromWindowFile();
+        _syncTimer.Start();
 
         _predictor = new LlmPredictor(_settings);
         _predictor.Updated += () => Dispatcher.BeginInvoke(() =>
         {
-            if (_settings.LlmEnabled)
+            if (UseLlmFor(InputBox.Text))
             {
                 _candidates = _predictor.Suggestions.ToList();
                 _candIndex = -1;
@@ -146,6 +173,7 @@ public partial class MainWindow : Window
             RequestLlmPrediction();
         };
         BuildTimeText.Text = BuildInfo.Display;
+        WindowNameBox.Text = state.Name;
         LlmToggle.IsChecked = _settings.LlmEnabled;
         MultiToggle.IsChecked = _settings.LlmMultiComplete;
         RawToggle.IsChecked = _settings.RawInput;
@@ -162,7 +190,11 @@ public partial class MainWindow : Window
             e.Handled = true;
             Dispatcher.BeginInvoke(DispatcherPriority.Input, FocusInput);
         };
-        Activated += (_, _) => Dispatcher.BeginInvoke(DispatcherPriority.Input, FocusInput);
+        Activated += (_, _) =>
+        {
+            LastActiveWindow.Save(_windowId, new System.Windows.Interop.WindowInteropHelper(this).Handle);
+            Dispatcher.BeginInvoke(DispatcherPriority.Input, FocusInput);
+        };
         FocusSelectAll.Attach(SearchBox);
         Term.CellSizeChanged += OnCellSizeChanged;
         Term.KeyDown += Term_KeyDown;
@@ -170,11 +202,12 @@ public partial class MainWindow : Window
         PreviewKeyDown += Window_PreviewKeyDown;
         LocationChanged += (_, _) => ScheduleSave();
         SizeChanged += (_, _) => ScheduleSave();
-        // Tab adoption between our windows arrives as WM_COPYDATA — a private channel, no OLE drag-drop involved.
+        // Tab adoption between our windows and open-tab-here requests arrive as WM_COPYDATA — a private channel, no OLE drag-drop involved.
         SourceInitialized += (_, _) =>
         {
-            var source = System.Windows.Interop.HwndSource.FromHwnd(new System.Windows.Interop.WindowInteropHelper(this).Handle);
-            source?.AddHook(WndProc);
+            var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            System.Windows.Interop.HwndSource.FromHwnd(handle)?.AddHook(WndProc);
+            LastActiveWindow.Save(_windowId, handle);
         };
         Closing += (_, _) =>
         {
@@ -184,9 +217,15 @@ public partial class MainWindow : Window
             }
             else
             {
-                SaveState();
+                SaveState(closedCleanly: !Program.SessionEnding);
             }
             _settingsWindow?.Close();
+            LastActiveWindow.Remove(_windowId);
+            // Timers must not outlive the window — the dispatcher may keep running (takeover teardown).
+            _saveTimer.Stop();
+            _renderTimer.Stop();
+            _syncTimer.Stop();
+            _llmTimer.Stop();
             foreach (var tab in _tabs)
             {
                 tab.Session?.Detach();
@@ -194,20 +233,42 @@ public partial class MainWindow : Window
         };
 
         // Restore: a shell host that survived (window closed or crashed moments ago) is reused as-is; a terminated one gets a tab with a resume confirmation instead of silently starting a new process — unless auto-resume is enabled, which resumes immediately (running the shell's AUTORESUME.cmd if present).
+        HttpOpenHost.Start(dir => Dispatcher.BeginInvoke(() =>
+        {
+            CreateTab(NewTabInfo(dir), activate: true, insertAfterActive: true);
+            ForceForeground();
+        }));
         foreach (var info in state.LoadTabs())
         {
             bool alive = HostInfo.IsShellAlive(info.Id);
-            var vm = CreateTab(info, activate: false, start: alive);
-            if (!alive && (_settings.AutoResumeShells || forceResume))
+            // A shell that never ran (no host.json) is a fresh seed, not a terminated session — start it outright instead of asking to resume.
+            bool everRan = File.Exists(AppPaths.HostInfoFile(info.Id));
+            var vm = CreateTab(info, activate: false, start: alive || !everRan);
+            if (!alive && everRan && (_settings.AutoResumeShells || forceResume))
             {
                 ResumeTab(vm, runAutoResumeCommand: true);
+            }
+            else if (!alive && !everRan)
+            {
+                // Fresh seeds with a pre-written AUTORESUME.cmd (--ensure launches) run their command immediately.
+                RunAutoResumeCommand(vm);
             }
         }
         if (_tabs.Count > 0)
         {
             ActivateTab(Math.Clamp(state.ActiveIndex, 0, _tabs.Count - 1));
         }
-        Loaded += (_, _) => FocusInput();
+        StartupTrace.Mark("tabs-created");
+        Loaded += (_, _) =>
+        {
+            StartupTrace.Mark("window-loaded");
+            FocusInput();
+        };
+        ContentRendered += (_, _) =>
+        {
+            StartupTrace.Mark("content-rendered");
+            StartupTrace.Flush();
+        };
     }
 
     private TabVm? Active => _active >= 0 && _active < _tabs.Count ? _tabs[_active] : null;
@@ -223,7 +284,7 @@ public partial class MainWindow : Window
     {
         var screen = new TermScreen(120, 30);
         var parser = new VtParser(screen) { ShowEscapes = _settings.ShowEscapeSequences };
-        var vm = new TabVm { Info = info, Screen = screen, Parser = parser };
+        var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput };
         parser.OnTitle = title => Dispatcher.BeginInvoke(() =>
         {
             title = title.Trim();
@@ -365,6 +426,50 @@ public partial class MainWindow : Window
         }
     }
 
+    // --ensure targeting: make the named shell run (fresh command via its AUTORESUME.cmd). If it's already running, this is a takeover — the old process dies first.
+    private void WindowNameBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+    {
+        if (_uiReady)
+        {
+            ScheduleSave();
+        }
+    }
+
+    private void EnsureShellRuns(string shellId)
+    {
+        SyncTabsFromWindowFile();
+        var vm = _tabs.FirstOrDefault(t => t.Info.Id == shellId);
+        if (vm == null)
+        {
+            AppLog.Write("ui", $"ensure-shell: {shellId} not in this window");
+            return;
+        }
+        // Focus follows the highest --order tab: lower-ordered ensures start their command in the background, so concurrent startup scripts always leave the highest-order tab focused (ties: either wins).
+        if (_tabs.All(t => t == vm || t.Info.EnsureOrder <= vm.Info.EnsureOrder))
+        {
+            ActivateTab(_tabs.IndexOf(vm));
+            ForceForeground();
+        }
+        if (vm.Session != null)
+        {
+            vm.Session.ShutdownHost();
+            vm.Session = null;
+            vm.Dead = false;
+            Task.Delay(ShellRestartDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
+            {
+                if (vm.Session == null && _tabs.Contains(vm))
+                {
+                    ResumeTab(vm, runAutoResumeCommand: true);
+                }
+            }));
+        }
+        else
+        {
+            vm.Dead = false;
+            ResumeTab(vm, runAutoResumeCommand: true);
+        }
+    }
+
     // Runs the shell's AUTORESUME.cmd by sending its path; input is queued in the pty, so cmd executes it as soon as its prompt is ready.
     private void RunAutoResumeCommand(TabVm vm)
     {
@@ -496,6 +601,17 @@ public partial class MainWindow : Window
             EndTitleEdit(vm, commit: false);
         };
         vm.RevertTitleButton = revertTitle;
+        // Indicator only: the shell has enabled win32-input-mode (an icon rather than title text — titles are too cramped for it).
+        var win32Badge = new TextBlock
+        {
+            Text = "⌨",
+            Foreground = new SolidColorBrush(Color.FromRgb(0x6F, 0xA8, 0xDC)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(6, 0, 0, 0),
+            Visibility = Visibility.Collapsed,
+            ToolTip = "win32-input-mode — full keyboard fidelity (Ctrl+Enter, Shift+Enter, Alt chords)",
+        };
+        vm.Win32Badge = win32Badge;
         // Indicator only — shows that this shell will auto-resume via AUTORESUME.cmd (tooltip shows the command); deliberately not clickable.
         var autoRun = new TextBlock
         {
@@ -537,6 +653,7 @@ public partial class MainWindow : Window
         panel.Children.Add(text);
         panel.Children.Add(editor);
         panel.Children.Add(revertTitle);
+        panel.Children.Add(win32Badge);
         panel.Children.Add(autoRun);
         panel.Children.Add(refresh);
         panel.Children.Add(close);
@@ -742,6 +859,24 @@ public partial class MainWindow : Window
             return IntPtr.Zero;
         }
         var cds = Marshal.PtrToStructure<COPYDATASTRUCT>(lParam);
+        if (cds.dwData == LastActiveWindow.OpenTabMessageId && cds.lpData != IntPtr.Zero)
+        {
+            var cwd = Marshal.PtrToStringUni(cds.lpData, cds.cbData / 2) ?? "";
+            handled = true;
+            Dispatcher.BeginInvoke(() =>
+            {
+                CreateTab(NewTabInfo(cwd), activate: true, insertAfterActive: true);
+                ForceForeground();
+            });
+            return (IntPtr)1;
+        }
+        if (cds.dwData == LastActiveWindow.EnsureShellMessageId && cds.lpData != IntPtr.Zero)
+        {
+            var ensureShellId = Marshal.PtrToStringUni(cds.lpData, cds.cbData / 2) ?? "";
+            handled = true;
+            Dispatcher.BeginInvoke(() => EnsureShellRuns(ensureShellId));
+            return (IntPtr)1;
+        }
         if (cds.dwData != AdoptMessageId || cds.lpData == IntPtr.Zero)
         {
             return IntPtr.Zero;
@@ -877,6 +1012,8 @@ public partial class MainWindow : Window
         Term.Attach(vm.Screen);
         CwdLabel.Text = vm.Info.Cwd;
         SetInputText(vm.PendingInput);
+        // The tab strip scrolls; an activated tab must be visible.
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () => vm.HeaderText.BringIntoView());
         RefreshCandidates();
         UpdateResumeOverlay();
         UpdateWindowTitle();
@@ -1046,11 +1183,12 @@ public partial class MainWindow : Window
 
     private static string TitleFlags(TabVm vm)
     {
-        return (vm.Parser.ShowEscapes ? "[esc] " : "") + (vm.Win32Input ? "[w32] " : "");
+        return vm.Parser.ShowEscapes ? "[esc] " : "";
     }
 
     private void RefreshTabTitle(TabVm vm)
     {
+        vm.Win32Badge.Visibility = vm.Win32Input ? Visibility.Visible : Visibility.Collapsed;
         var text = vm.HeaderText;
         text.Inlines.Clear();
         var flags = TitleFlags(vm);
@@ -1173,7 +1311,10 @@ public partial class MainWindow : Window
                     continue;
                 }
                 var info = ShellInfo.Load(id) ?? new ShellInfo();
-                CreateTab(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle }, activate: false, start: HostInfo.IsShellAlive(id));
+                var tabInfo = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder };
+                // Ordered (--ensure --order) tabs land at their sorted position; unordered ones append.
+                int insertAt = tabInfo.EnsureOrder != 0 ? _tabs.TakeWhile(t => t.Info.EnsureOrder <= tabInfo.EnsureOrder).Count() : -1;
+                CreateTab(tabInfo, activate: false, start: HostInfo.IsShellAlive(id), insertIndex: insertAt);
                 added = true;
                 AppLog.Write("ui", $"sync: adopted shell {id} listed in window {_windowId}");
             }
@@ -1194,11 +1335,20 @@ public partial class MainWindow : Window
         _saveTimer.Start();
     }
 
-    private void SaveState()
+    private void SaveState(bool closedCleanly = false)
     {
+        foreach (var tab in _tabs)
+        {
+            if (tab.Info.PendingInput != tab.PendingInput)
+            {
+                tab.Info.PendingInput = tab.PendingInput;
+                ShellInfo.Save(tab.Info);
+            }
+        }
         var self = Process.GetCurrentProcess();
         new Termiot.WindowState
         {
+            Name = WindowNameBox.Text.Trim(),
             Shells = _tabs.Select(t => t.Info.Id).ToList(),
             ActiveIndex = _active,
             X = Finite(Left),
@@ -1207,6 +1357,8 @@ public partial class MainWindow : Window
             Height = Finite(ActualHeight),
             OwnerPid = self.Id,
             OwnerStartTicks = self.StartTime.Ticks,
+            ClosedCleanly = closedCleanly,
+            ClosedAtTicks = closedCleanly ? DateTime.UtcNow.Ticks : 0,
         }.Save(_windowId);
         foreach (var tab in _tabs)
         {
@@ -1225,7 +1377,7 @@ public partial class MainWindow : Window
         else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.T)
         {
             e.Handled = true;
-            CreateTab(NewTabInfo(Active?.Info.Cwd is { Length: > 0 } cwd ? cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), activate: true, insertAfterActive: true);
+            OpenNewTab();
         }
         else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.F)
         {
@@ -1431,6 +1583,7 @@ public partial class MainWindow : Window
         if (Active is { } vm)
         {
             vm.PendingInput = InputBox.Text;
+            ScheduleSave();
         }
         RefreshCandidates();
     }
@@ -1440,7 +1593,7 @@ public partial class MainWindow : Window
     {
         _candIndex = -1;
         _candWindowStart = 0;
-        if (_settings.LlmEnabled)
+        if (UseLlmFor(InputBox.Text))
         {
             ScheduleLlmPrediction();
         }
@@ -1449,6 +1602,48 @@ public partial class MainWindow : Window
             _candidates = BuildTabCandidates(InputBox.Text);
         }
         UpdateLlmUi();
+    }
+
+    private bool UseLlmFor(string text)
+    {
+        if (!_predictor.IsConfigured)
+        {
+            return false;
+        }
+        return _settings.LlmEnabled || (_settings.LlmTriggerEnabled && MatchLlmTrigger(text) != null);
+    }
+
+    // Trigger matching compares letters only, case-insensitively ("Hey, llm" == "heyllm"); returns the instruction text after the matched phrase, or null.
+    private string? MatchLlmTrigger(string text)
+    {
+        foreach (var phrase in _settings.LlmTriggerPhrases.Split('|'))
+        {
+            var normPhrase = new string(phrase.Where(char.IsLetter).ToArray()).ToLowerInvariant();
+            if (normPhrase.Length == 0)
+            {
+                continue;
+            }
+            int matched = 0;
+            int position = 0;
+            while (position < text.Length && matched < normPhrase.Length)
+            {
+                var c = text[position];
+                if (char.IsLetter(c))
+                {
+                    if (char.ToLowerInvariant(c) != normPhrase[matched])
+                    {
+                        break;
+                    }
+                    matched++;
+                }
+                position++;
+            }
+            if (matched == normPhrase.Length)
+            {
+                return text[position..].TrimStart(' ', ',', ':', '.', '-');
+            }
+        }
+        return null;
     }
 
     private void SetInputText(string text)
@@ -1517,6 +1712,11 @@ public partial class MainWindow : Window
     // Tab / Down move forward through the suggestion list, Shift+Tab / Up move back; the visible window of rows rolls along with the selection, and one step past the ends restores what the user had typed.
     private void CycleCandidates(bool backwards)
     {
+        if (_candidates.Count == 0 && !UseLlmFor(InputBox.Text))
+        {
+            _candidates = BuildTabCandidates(InputBox.Text);
+            _candWindowStart = 0;
+        }
         if (_candidates.Count == 0)
         {
             return;
@@ -1608,7 +1808,11 @@ public partial class MainWindow : Window
 
     private void UpdateLlmUi()
     {
-        LlmCostText.Text = _settings.LlmRequestCount > 0 || _settings.LlmTotalCostUsd > 0 ? "$" + _settings.LlmTotalCostUsd.ToString("0.####") : "";
+        LlmCostText.Text = _settings.LlmRequestCount > 0 || _settings.LlmTotalCostUsd > 0 ? $"${_settings.LlmTotalCostUsd:0.####} ({_settings.LlmRequestCount} calls)" : "";
+        // A matched trigger phrase runs the LLM even with the toggle off — highlight the toggle so the user can tell why suggestions are appearing (without changing its checked state).
+        bool triggered = !_settings.LlmEnabled && _settings.LlmTriggerEnabled && _predictor.IsConfigured && MatchLlmTrigger(InputBox.Text) != null;
+        LlmToggle.Foreground = new SolidColorBrush(triggered ? Color.FromRgb(0x7F, 0xD4, 0x7F) : Color.FromRgb(0x99, 0x99, 0x99));
+        LlmToggle.FontWeight = triggered ? FontWeights.Bold : FontWeights.Normal;
         _candWindowStart = Math.Clamp(_candWindowStart, 0, Math.Max(0, _candidates.Count - _suggestionRows.Count));
         for (int i = 0; i < _suggestionRows.Count; i++)
         {
@@ -1623,7 +1827,7 @@ public partial class MainWindow : Window
 
     private void ScheduleLlmPrediction()
     {
-        if (!_settings.LlmEnabled || !_predictor.IsConfigured || RawMode)
+        if (!UseLlmFor(InputBox.Text) || RawMode)
         {
             return;
         }
@@ -1633,7 +1837,7 @@ public partial class MainWindow : Window
 
     private void RequestLlmPrediction()
     {
-        if (!_settings.LlmEnabled || !_predictor.IsConfigured || Active is not { Dead: false, Session: not null } vm)
+        if (!UseLlmFor(InputBox.Text) || Active is not { Dead: false, Session: not null } vm)
         {
             return;
         }
@@ -1697,7 +1901,21 @@ public partial class MainWindow : Window
                 messages.Add(new LlmMessage("user", "Output:\n" + output));
             }
         }
-        messages.Add(new LlmMessage("user", $"Current directory: {vm.Info.Cwd}\n" + (typed.Length > 0 ? $"The user has typed so far: {typed}\nComplete or rewrite it into the full command they most likely want." : "Predict the next command the user will run.")));
+        var instruction = MatchLlmTrigger(typed);
+        string ask;
+        if (instruction is { Length: > 0 })
+        {
+            ask = $"The user asked in natural language: \"{instruction}\"\nRespond with the command(s) that accomplish this.";
+        }
+        else if (typed.Length > 0)
+        {
+            ask = $"The user has typed so far: {typed}\nComplete or rewrite it into the full command they most likely want.";
+        }
+        else
+        {
+            ask = "Predict the next command the user will run.";
+        }
+        messages.Add(new LlmMessage("user", $"Current directory: {vm.Info.Cwd}\n" + ask));
         var display = string.Join("\n\n", messages.Select(m => $"[{m.Role}]\n{m.Content}"));
         return (messages, display);
     }
@@ -1952,7 +2170,23 @@ public partial class MainWindow : Window
 
     private void NewTabBtn_Click(object sender, RoutedEventArgs e)
     {
-        CreateTab(NewTabInfo(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), activate: true, insertAfterActive: true);
+        OpenNewTab();
+    }
+
+    // Tight tab strip: the + rides inline right after the last tab, and only when the tabs overflow do the scroll arrows and a fixed always-visible + appear.
+    private void TabScroller_ScrollChanged(object sender, System.Windows.Controls.ScrollChangedEventArgs e)
+    {
+        bool overflow = TabScroller.ScrollableWidth > 0.5;
+        ScrollLeftBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
+        ScrollRightBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
+        NewTabBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
+        NewTabInlineBtn.Visibility = overflow ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    // The + button and Ctrl+T are the same action: a new tab in the current tab's directory.
+    private void OpenNewTab()
+    {
+        CreateTab(NewTabInfo(Active?.Info.Cwd is { Length: > 0 } cwd ? cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), activate: true, insertAfterActive: true);
     }
 
     private void SettingsBtn_Click(object sender, RoutedEventArgs e)
@@ -2024,8 +2258,118 @@ public partial class MainWindow : Window
         ApplyLlmUi();
     }
 
+    private void CenterOverWindow(IntPtr reference)
+    {
+        try
+        {
+            double scale = VisualTreeHelper.GetDpi(this).DpiScaleX;
+            double left;
+            double top;
+            if (reference != IntPtr.Zero && GetWindowRect(reference, out var rect) && rect.Right > rect.Left)
+            {
+                left = (rect.Left + rect.Right) / 2.0 / scale - Width / 2;
+                top = (rect.Top + rect.Bottom) / 2.0 / scale - Height / 2;
+            }
+            else
+            {
+                left = (SystemParameters.WorkArea.Width - Width) / 2;
+                top = (SystemParameters.WorkArea.Height - Height) / 2;
+            }
+            Left = Math.Clamp(left, SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenLeft + SystemParameters.VirtualScreenWidth - Width);
+            Top = Math.Clamp(top, SystemParameters.VirtualScreenTop, SystemParameters.VirtualScreenTop + SystemParameters.VirtualScreenHeight - Height);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("ui", "center over foreground failed: " + ex.Message);
+        }
+    }
+
+    // Windows refuses SetForegroundWindow to processes the user never interacted with, so a freshly spawned window (Cursor's Ctrl+Shift+C) can't take focus the polite way. This throws the whole launcher toolbox at it — Alt nudge (defeats the foreground lock), input-queue attach to the foreground thread, BringWindowToTop, SwitchToThisWindow — and retries on a timer, because the launcher often re-asserts its own focus right after spawning us and a single early attempt loses that race.
+    private void ForceForeground()
+    {
+        var attemptDelaysMs = new[] { 0, 100, 250, 500, 1000 };
+        foreach (var delay in attemptDelaysMs)
+        {
+            Task.Delay(delay).ContinueWith(task => Dispatcher.BeginInvoke(() =>
+            {
+                var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+                if (handle == IntPtr.Zero || GetForegroundWindow() == handle)
+                {
+                    return;
+                }
+                keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
+                keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                var foreground = GetForegroundWindow();
+                uint foregroundThread = foreground != IntPtr.Zero ? GetWindowThreadProcessId(foreground, out _) : 0;
+                uint ourThread = GetCurrentThreadId();
+                bool attached = foregroundThread != 0 && foregroundThread != ourThread && AttachThreadInput(ourThread, foregroundThread, true);
+                BringWindowToTop(handle);
+                SetForegroundWindow(handle);
+                SwitchToThisWindow(handle, true);
+                if (attached)
+                {
+                    AttachThreadInput(ourThread, foregroundThread, false);
+                }
+                Activate();
+                FocusInput();
+            }));
+        }
+    }
+
+    // Momentarily topmost, then not: lands above every normal window without activating (SWP_NOACTIVATE), so the launcher keeps keyboard focus.
+    private void BringToTopWithoutFocus()
+    {
+        var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(handle, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
     private const int WM_COPYDATA = 0x004A;
     private const uint GA_ROOT = 2;
+    private static readonly IntPtr HWND_TOPMOST = new(-1);
+    private static readonly IntPtr HWND_NOTOPMOST = new(-2);
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOACTIVATE = 0x0010;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hwnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+    private const byte VK_MENU = 0x12;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern void SwitchToThisWindow(IntPtr hWnd, bool fUnknown);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT

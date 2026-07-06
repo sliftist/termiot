@@ -79,13 +79,16 @@ public sealed class LlmPredictor
                 }
                 var pricing = _models?.FirstOrDefault(m => m.Id == _settings.LlmModel);
                 int maxTokens = Math.Min(BaseMaxTokens + PerSuggestionMaxTokens * job.Count, MaxTokensCap);
+                // Counted at call time, not completion, so the readout reflects in-flight requests immediately.
+                _settings.LlmRequestCount++;
+                _settings.Save();
+                Updated?.Invoke();
                 var completion = await OpenRouter.Complete(key, _settings.LlmModel, job.Messages, maxTokens, pricing);
                 Suggestions = completion.Lines.Take(job.Count).ToList();
                 LastError = "";
                 _settings.LlmTotalCostUsd += completion.CostUsd;
                 _settings.LlmInputTokens += completion.PromptTokens;
                 _settings.LlmOutputTokens += completion.CompletionTokens;
-                _settings.LlmRequestCount++;
                 _settings.LlmTotalLatencyMs += completion.LatencyMs;
                 _settings.Save();
             }

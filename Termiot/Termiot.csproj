@@ -9,9 +9,18 @@
     <StartupObject>Termiot.Program</StartupObject>
   </PropertyGroup>
 
+  <!-- Only applied by `dotnet publish` (the SDK sets _IsPublishing there), so normal builds/runs stay framework-dependent and fast. Self-contained because target machines won't have the runtime installed. -->
+  <PropertyGroup Condition="'$(_IsPublishing)' == 'true'">
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- WPF's native libs (wpfgfx, PresentationNative, …) otherwise land beside the exe, and the release only ships the exe. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
   <ItemGroup>
-    <None Update="restart.bat" CopyToOutputDirectory="PreserveNewest" />
-    <None Update="start-instance.bat" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="restart.bat" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
+    <None Update="start-instance.bat" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
   </ItemGroup>
 
   <!-- Baked into the assembly (rather than reading the exe's mtime) so the time survives the output being copied into timestamped instance folders. RepoRoot lets a copied instance find the repo to trigger rebuilds. -->

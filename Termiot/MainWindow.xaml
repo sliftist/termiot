@@ -12,12 +12,16 @@
         <Button x:Name="ReloadBtn" DockPanel.Dock="Right" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones)" />
         <Button x:Name="SettingsBtn" DockPanel.Dock="Right" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
         <TextBlock x:Name="BuildTimeText" DockPanel.Dock="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
-        <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" />
-        <Button x:Name="ScrollRightBtn" DockPanel.Dock="Right" Content="▶" Click="ScrollRightBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" />
-        <Button x:Name="ScrollLeftBtn" DockPanel.Dock="Left" Content="◀" Click="ScrollLeftBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" />
-        <ScrollViewer x:Name="TabScroller" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" PreviewMouseWheel="TabScroller_PreviewMouseWheel">
+        <TextBox x:Name="WindowNameBox" DockPanel.Dock="Right" MinWidth="50" VerticalAlignment="Center" Margin="6,0,0,0" Background="Transparent" Foreground="#FF9A9AC8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontSize="11" TextChanged="WindowNameBox_TextChanged" ToolTip="Window name — targetable from launches via --ensure --window &lt;name&gt;" />
+        <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" Visibility="Collapsed" />
+        <Button x:Name="ScrollRightBtn" DockPanel.Dock="Right" Content="▶" Click="ScrollRightBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
+        <Button x:Name="ScrollLeftBtn" DockPanel.Dock="Left" Content="◀" Click="ScrollLeftBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
+        <ScrollViewer x:Name="TabScroller" HorizontalAlignment="Left" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" PreviewMouseWheel="TabScroller_PreviewMouseWheel" ScrollChanged="TabScroller_ScrollChanged">
           <Grid>
-            <StackPanel x:Name="TabStrip" Orientation="Horizontal" />
+            <StackPanel Orientation="Horizontal">
+              <StackPanel x:Name="TabStrip" Orientation="Horizontal" />
+              <Button x:Name="NewTabInlineBtn" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" />
+            </StackPanel>
             <Canvas IsHitTestVisible="False">
               <Rectangle x:Name="DropIndicator" Width="3" Fill="#FF4EC94E" Visibility="Collapsed" />
             </Canvas>

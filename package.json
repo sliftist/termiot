@@ -1,9 +1,10 @@
 {
     "name": "termiot",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "private": true,
     "scripts": {
-        "build": "node scripts/dotnet.js build Termiot",
+        "build": "node scripts/build.js",
+        "release": "node scripts/publish-release.js",
         "build-claude": "node scripts/dotnet.js build Termiot/Termiot.csproj -o Termiot/bin/claude-check",
         "restart": "node scripts/restart.js",
         "start-instance": "node scripts/start-instance.js",

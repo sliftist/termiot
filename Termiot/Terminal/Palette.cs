@@ -9,6 +9,7 @@ public static class Palette
     public const uint SearchBg = 0xFF5C5C1A;
     public const uint SearchCurrentBg = 0xFFB58900;
     public const uint SelectionBg = 0xFF264F78;
+    public const uint LinkHoverBg = 0xFF2E4A3D;
 
     private static readonly uint[] Base16 =
     {

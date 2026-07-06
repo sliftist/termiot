@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -21,6 +23,7 @@ public sealed class TerminalControl : FrameworkElement
     // SGR 2 (dim/faint): the foreground is pulled this far toward the background.
     private const int DimAlpha = 130;
     private const int CursorBlinkMs = 530;
+    private static readonly Regex UrlRegex = new(@"https?://[^\s""'<>\)\]]+", RegexOptions.Compiled);
 
     private GlyphAtlas? _atlas;
     private double _dpiScale = 1.0;
@@ -38,6 +41,7 @@ public sealed class TerminalControl : FrameworkElement
     private bool _hasSelection;
     private (int Line, int Col) _selAnchor;
     private (int Line, int Col) _selEnd;
+    private List<(int Line, int Start, int End)>? _hoverLink;
 
     public bool ShowTermCursor;
     public event Action<int, int>? CellSizeChanged;
@@ -63,6 +67,8 @@ public sealed class TerminalControl : FrameworkElement
             }
         };
         _blinkTimer.Start();
+        Loaded += (_, _) => _blinkTimer.Start();
+        Unloaded += (_, _) => _blinkTimer.Stop();
     }
 
     public void Attach(TermScreen screen)
@@ -134,7 +140,11 @@ public sealed class TerminalControl : FrameworkElement
         catch
         {
         }
-        _atlas ??= new GlyphAtlas(_dpiScale);
+        if (_atlas == null)
+        {
+            _atlas = new GlyphAtlas(_dpiScale);
+            StartupTrace.Mark("glyph-atlas-built");
+        }
         int pxW = (int)(ActualWidth * _dpiScale);
         int pxH = (int)(ActualHeight * _dpiScale);
         if (pxW <= 0 || pxH <= 0)
@@ -186,7 +196,7 @@ public sealed class TerminalControl : FrameworkElement
                 int cellCount = Math.Min(_cols, line.Cells.Length);
                 for (int c = 0; c < cellCount; c++)
                 {
-                    DrawCell(r, c, line.Cells[c], spans, IsSelected(abs, c));
+                    DrawCell(r, c, line.Cells[c], spans, IsSelected(abs, c), IsHoveredLink(abs, c));
                 }
             }
             if (ShowTermCursor && _scrollOffset == 0 && _screen.CursorVisible)
@@ -209,7 +219,14 @@ public sealed class TerminalControl : FrameworkElement
         }
         _bmp.WritePixels(new Int32Rect(0, 0, _pxWidth, _pxHeight), _pix, _pxWidth * 4, 0);
         InvalidateVisual();
+        if (!_firstFrameMarked)
+        {
+            _firstFrameMarked = true;
+            StartupTrace.Mark("first-frame-painted");
+        }
     }
+
+    private bool _firstFrameMarked;
 
     private void DrawCursorBar(int row, int col)
     {
@@ -227,7 +244,7 @@ public sealed class TerminalControl : FrameworkElement
         }
     }
 
-    private void DrawCell(int row, int col, Cell cell, List<SearchSpan>? spans, bool selected)
+    private void DrawCell(int row, int col, Cell cell, List<SearchSpan>? spans, bool selected, bool hoveredLink)
     {
         var atlas = _atlas!;
         int cw = atlas.CellWidth;
@@ -267,6 +284,10 @@ public sealed class TerminalControl : FrameworkElement
                     break;
                 }
             }
+        }
+        if (hoveredLink)
+        {
+            bg = Palette.LinkHoverBg;
         }
         if (selected)
         {
@@ -421,10 +442,98 @@ public sealed class TerminalControl : FrameworkElement
         return (line, col);
     }
 
+    private sealed class LinkHit
+    {
+        public string Url = "";
+        public List<(int Line, int Start, int End)> Segments = new();
+    }
+
+    // Links are found by scanning text — no escape-sequence hyperlinks needed, plain printed URLs work. Long URLs hard-wrap across rows, so the pointed-at line is joined with adjacent lines that are written edge-to-edge (the wrap signature) before matching; the returned segments map the URL back onto each visual line for highlighting.
+    private const int MaxWrapJoinLines = 8;
+
+    private LinkHit? FindLinkAt(Point pos)
+    {
+        if (_screen == null)
+        {
+            return null;
+        }
+        var (line, col) = CellAt(pos);
+        lock (_screen.Sync)
+        {
+            int total = _screen.TotalLines;
+            if (line >= total)
+            {
+                return null;
+            }
+            int first = line;
+            while (first > 0 && line - first < MaxWrapJoinLines && LineIsFull(first - 1))
+            {
+                first--;
+            }
+            int last = line;
+            while (last < total - 1 && last - line < MaxWrapJoinLines && LineIsFull(last))
+            {
+                last++;
+            }
+            var parts = new List<(int Line, int Offset, int Length)>();
+            var joined = new StringBuilder();
+            int clickOffset = -1;
+            for (int l = first; l <= last; l++)
+            {
+                var text = _screen.GetLine(l).GetText();
+                if (l == line)
+                {
+                    clickOffset = joined.Length + col;
+                }
+                parts.Add((l, joined.Length, text.Length));
+                joined.Append(text);
+            }
+            var joinedText = joined.ToString();
+            foreach (Match match in UrlRegex.Matches(joinedText))
+            {
+                var url = match.Value.TrimEnd('.', ',', ';');
+                if (clickOffset >= match.Index && clickOffset < match.Index + url.Length)
+                {
+                    var hit = new LinkHit { Url = url };
+                    foreach (var part in parts)
+                    {
+                        int start = Math.Max(match.Index, part.Offset);
+                        int end = Math.Min(match.Index + url.Length, part.Offset + part.Length);
+                        if (start < end)
+                        {
+                            hit.Segments.Add((part.Line, start - part.Offset, end - part.Offset));
+                        }
+                    }
+                    return hit;
+                }
+            }
+        }
+        return null;
+    }
+
+    private bool LineIsFull(int line)
+    {
+        var cells = _screen!.GetLine(line);
+        return cells.Cells.Length > 0 && cells.GetText().Length == cells.Cells.Length;
+    }
+
     protected override void OnMouseDown(MouseButtonEventArgs e)
     {
         base.OnMouseDown(e);
         Focus();
+        if (e.ChangedButton == MouseButton.Left && (Keyboard.Modifiers & ModifierKeys.Control) != 0 && FindLinkAt(e.GetPosition(this)) is { } linkHit)
+        {
+            e.Handled = true;
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(linkHit.Url) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("ui", "open link failed: " + ex.Message);
+            }
+            return;
+        }
         if (e.ChangedButton == MouseButton.Left && _screen != null)
         {
             _hasSelection = false;
@@ -464,6 +573,13 @@ public sealed class TerminalControl : FrameworkElement
             }
         }
         var pos = e.GetPosition(this);
+        var hover = (Keyboard.Modifiers & ModifierKeys.Control) != 0 ? FindLinkAt(pos) : null;
+        Cursor = hover != null ? Cursors.Hand : null;
+        if (!SegmentsEqual(hover?.Segments, _hoverLink))
+        {
+            _hoverLink = hover?.Segments;
+            RenderFrame();
+        }
         int col = (int)(pos.X * _dpiScale) / _atlas.CellWidth;
         int row = (int)(pos.Y * _dpiScale) / _atlas.CellHeight;
         string? desc = null;
@@ -501,6 +617,52 @@ public sealed class TerminalControl : FrameworkElement
         if (ToolTip != null)
         {
             ToolTip = null;
+        }
+    }
+
+    private static bool SegmentsEqual(List<(int Line, int Start, int End)>? a, List<(int Line, int Start, int End)>? b)
+    {
+        if (a == null || b == null)
+        {
+            return a == b;
+        }
+        if (a.Count != b.Count)
+        {
+            return false;
+        }
+        for (int i = 0; i < a.Count; i++)
+        {
+            if (a[i] != b[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private bool IsHoveredLink(int line, int col)
+    {
+        if (_hoverLink == null)
+        {
+            return false;
+        }
+        foreach (var segment in _hoverLink)
+        {
+            if (segment.Line == line && col >= segment.Start && col < segment.End)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected override void OnMouseLeave(MouseEventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (_hoverLink != null)
+        {
+            _hoverLink = null;
+            RenderFrame();
         }
     }
 }

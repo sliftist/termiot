@@ -50,6 +50,7 @@ async function main() {
     }
     const dest = path.join(INSTANCES, timestamp());
     fs.cpSync(SRC, dest, { recursive: true });
+    require("./stable-launcher").writeStableBat(path.join(dest, "Termiot.exe"));
     log(`build ok, copied to ${dest}, taking over window ${windowId}`);
     const child = spawn(path.join(dest, "Termiot.exe"), ["--window", windowId, "--resume", "--takeover"], { detached: true, stdio: "ignore", env: { ...process.env, DOTNET_ROOT: USER_DOTNET_ROOT } });
     child.unref();
