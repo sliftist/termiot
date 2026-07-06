@@ -11,29 +11,28 @@ public static class CursorExtension
 
     public static bool IsInstalled => File.Exists(Path.Combine(ExtensionDir, "package.json"));
 
-    public static void Install()
-    {
-        StableLauncher.EnsureNewest();
-        Directory.CreateDirectory(ExtensionDir);
-        File.WriteAllText(Path.Combine(ExtensionDir, "package.json"),
-            """
-            {
-                "name": "termiot-open",
-                "displayName": "Open Termiot here",
-                "description": "Opens a Termiot tab in the current workspace folder via the local open-tab endpoint.",
-                "version": "1.0.0",
-                "publisher": "termiot",
-                "engines": { "vscode": "^1.70.0" },
-                "main": "./extension.js",
-                "activationEvents": ["onCommand:termiot.open"],
-                "contributes": {
-                    "commands": [{ "command": "termiot.open", "title": "Open Termiot here" }],
-                    "keybindings": [{ "command": "termiot.open", "key": "ctrl+shift+c" }]
-                }
+    private const string PackageJson =
+        """
+        {
+            "name": "termiot-open",
+            "displayName": "Open Termiot here",
+            "description": "Opens a Termiot tab in the current workspace folder via the local open-tab endpoint.",
+            "version": "1.0.0",
+            "publisher": "termiot",
+            "engines": { "vscode": "^1.70.0" },
+            "main": "./extension.js",
+            "activationEvents": ["onCommand:termiot.open"],
+            "contributes": {
+                "commands": [{ "command": "termiot.open", "title": "Open Termiot here" }],
+                "keybindings": [{ "command": "termiot.open", "key": "ctrl+shift+c" }]
             }
-            """);
+        }
+        """;
+
+    private static string BuildExtensionJs()
+    {
         var batPath = StableLauncher.BatPath.Replace("\\", "\\\\");
-        File.WriteAllText(Path.Combine(ExtensionDir, "extension.js"),
+        return
             $$"""
             const vscode = require('vscode');
             const http = require('http');
@@ -62,8 +61,38 @@ public static class CursorExtension
             }
 
             module.exports = { activate };
-            """);
+            """;
+    }
+
+    public static void Install()
+    {
+        StableLauncher.EnsureNewest();
+        Directory.CreateDirectory(ExtensionDir);
+        File.WriteAllText(Path.Combine(ExtensionDir, "package.json"), PackageJson);
+        File.WriteAllText(Path.Combine(ExtensionDir, "extension.js"), BuildExtensionJs());
         AppLog.Write("cursor", "extension installed at " + ExtensionDir);
+    }
+
+    // Renderer startup calls this so an installed extension follows code changes without user action; Cursor loads the new file on its next restart.
+    public static void EnsureUpToDate()
+    {
+        try
+        {
+            if (!IsInstalled)
+            {
+                return;
+            }
+            var jsPath = Path.Combine(ExtensionDir, "extension.js");
+            var current = File.Exists(jsPath) ? File.ReadAllText(jsPath) : "";
+            if (current != BuildExtensionJs() || File.ReadAllText(Path.Combine(ExtensionDir, "package.json")) != PackageJson)
+            {
+                Install();
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("cursor", "extension refresh failed: " + ex.Message);
+        }
     }
 
     public static void Uninstall()

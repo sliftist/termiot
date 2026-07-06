@@ -97,7 +97,7 @@ public static class LastActiveWindow
         return SendCopyData(new IntPtr(record.Hwnd), EnsureShellMessageId, shellId);
     }
 
-    // "Same screen" can't come from monitor handles — spanning setups (NVIDIA Surround) merge every panel into one logical monitor. Instead a window whose rect substantially overlaps the reference window's horizontal span (i.e. sits above/below it) is treated as on the same physical screen; without such a window, plain recency wins.
+    // "Same screen" can't come from monitor handles — spanning setups (NVIDIA Surround) merge every panel into one logical monitor. Instead: a candidate is above/below the reference when at least half of the narrower window's width lies within the wider one's horizontal span.
     private const double SameColumnMinOverlap = 0.5;
 
     private static List<Record> AliveRecordsPreferring(IntPtr reference)
@@ -127,21 +127,28 @@ public static class LastActiveWindow
         {
             AppLog.Write("ui", "active-window scan failed: " + ex.Message);
         }
-        bool haveReference = reference != IntPtr.Zero && GetWindowRect(reference, out var refRect) && refRect.Right > refRect.Left;
-        return alive
-            .OrderByDescending(r => haveReference && SharesColumn(reference, new IntPtr(r.Hwnd)))
+        var refRect = default(RECT);
+        bool haveReference = reference != IntPtr.Zero && GetWindowRect(reference, out refRect) && refRect.Right > refRect.Left;
+        var ordered = alive
+            .OrderByDescending(r => haveReference && SharesColumn(refRect, new IntPtr(r.Hwnd)))
             .ThenByDescending(r => r.LastActiveTicks)
             .ToList();
+        if (haveReference)
+        {
+            var verdicts = string.Join("; ", ordered.Select(r => GetWindowRect(new IntPtr(r.Hwnd), out var c) ? $"pid {r.Pid} x[{c.Left}..{c.Right}] {(SharesColumn(refRect, new IntPtr(r.Hwnd)) ? "stacked" : "elsewhere")}" : $"pid {r.Pid} no-rect"));
+            AppLog.Write("route", $"reference x[{refRect.Left}..{refRect.Right}] → {verdicts}");
+        }
+        return ordered;
     }
 
-    private static bool SharesColumn(IntPtr reference, IntPtr candidate)
+    private static bool SharesColumn(RECT reference, IntPtr candidate)
     {
-        if (!GetWindowRect(reference, out var a) || !GetWindowRect(candidate, out var b))
+        if (!GetWindowRect(candidate, out var b) || b.Right <= b.Left)
         {
             return false;
         }
-        double overlap = Math.Min(a.Right, b.Right) - Math.Max(a.Left, b.Left);
-        double narrower = Math.Min(a.Right - a.Left, b.Right - b.Left);
+        double overlap = Math.Min(reference.Right, b.Right) - Math.Max(reference.Left, b.Left);
+        double narrower = Math.Min(reference.Right - reference.Left, b.Right - b.Left);
         return narrower > 0 && overlap / narrower >= SameColumnMinOverlap;
     }
 

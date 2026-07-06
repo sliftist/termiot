@@ -75,33 +75,17 @@ public static class Program
             return EnsureTab(args) ? 0 : 1;
         }
 
-        // Fast path for "open a terminal here" launches (Cursor, Explorer): before paying any WPF cost, hand the directory to the most recently used live window, which adds a focused tab there. Only when no window is alive does this fall through to a cold start.
-        string? openDir = null;
-        if (args.Length >= 2 && args[0] == "--open")
-        {
-            var target = args[1];
-            var dir = File.Exists(target) ? Path.GetDirectoryName(target) : target;
-            if (dir != null && Directory.Exists(dir))
-            {
-                openDir = dir;
-            }
-        }
-        else if (args.Length == 0 && HasMeaningfulCwd())
-        {
-            openDir = Environment.CurrentDirectory;
-        }
-        if (openDir != null && LastActiveWindow.TryOpenTab(openDir))
-        {
-            AppLog.Write("ui", $"opened tab in last-active window: {openDir}");
-            return 0;
-        }
-
+        // Only the Cursor extension (HttpOpenHost) routes into an existing window as a tab — that's the "open fast" path. Every process launch (Explorer's --open, windowsExec, plain runs) deliberately opens its own new window.
         if (PrepareLaunch(args) is not { } plan)
         {
             return 0;
         }
         StartupTrace.Mark("window-claimed");
-        Task.Run(StableLauncher.EnsureNewest);
+        Task.Run(() =>
+        {
+            StableLauncher.EnsureNewest();
+            CursorExtension.EnsureUpToDate();
+        });
         // Loading Consolas is the bulk of the glyph atlas cost; warming it on a worker overlaps that with WPF's own initialization.
         Task.Run(() =>
         {
