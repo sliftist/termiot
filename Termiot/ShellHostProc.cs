@@ -21,8 +21,8 @@ public static class ShellHostProc
     private const int ExitLingerMs = 300;
     private const int PipeRetryDelayMs = 1000;
     private const int LivenessCheckMs = 5000;
-    // Long enough for a relaunched window or a drag-handoff target to connect before the orphan check pulls the trigger.
-    private const int OrphanGraceMs = 10000;
+    // Long enough for a relaunched or rebuilt-and-reloaded window, or a drag-handoff target, to connect before the orphan check pulls the trigger — renderer restarts must never cost the shells.
+    private const int OrphanGraceMs = 15000;
     private const int PtyInputQueueCap = 1024;
     private const int PipeCreateMaxFailures = 3;
     private const int LogFlushIntervalMs = 1000;
@@ -32,7 +32,7 @@ public static class ShellHostProc
 
     private static readonly object IoLock = new();
     private static NamedPipeServerStream? _client;
-    private static ConPty _pty = null!;
+    private static IPtySession _pty = null!;
     private static string _logPath = null!;
     private static string _shellId = null!;
     private static readonly BlockingCollection<byte[]> PtyInputQueue = new(new ConcurrentQueue<byte[]>(), PtyInputQueueCap);
@@ -46,12 +46,7 @@ public static class ShellHostProc
 
     public static void Run(string shellId, string startDir)
     {
-        _shellId = shellId;
-        Directory.CreateDirectory(AppPaths.ShellDir(shellId));
-        _logPath = AppPaths.LogFile(shellId);
-        TrimLog();
-        HostInfo.SaveCurrentProcess(shellId);
-        _writeLogImmediately = AppSettings.Load().WriteLogImmediately;
+        Setup(shellId);
         if (!Directory.Exists(startDir))
         {
             startDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -59,9 +54,33 @@ public static class ShellHostProc
         string shellPath = Environment.GetEnvironmentVariable("ComSpec") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
         // Set on the host so cmd inherits it: the shell (and AUTORESUME.cmd) can reference its own state folder.
         Environment.SetEnvironmentVariable("SHELLFOLDER", AppPaths.ShellDir(shellId));
-        _pty = ConPty.Start($"\"{shellPath}\"", startDir, DefaultCols, DefaultRows);
-        AppLog.Write("shellhost", $"shell {shellId} started, cmd pid {_pty.ChildPid}");
+        var pty = ConPty.Start($"\"{shellPath}\"", startDir, DefaultCols, DefaultRows);
+        AppLog.Write("shellhost", $"shell {shellId} started, cmd pid {pty.ChildPid}");
+        MainLoop(shellId, pty);
+    }
 
+    // Same host, but the pty came from a default-terminal handoff instead of a cmd we spawned.
+    public static void RunHandoff(string shellId, long outRead, long inWrite, long signal, long client, long reference)
+    {
+        Setup(shellId);
+        var pty = new HandoffPty(outRead, inWrite, signal, client, reference);
+        AppLog.Write("shellhost", $"shell {shellId} started from handoff");
+        MainLoop(shellId, pty);
+    }
+
+    private static void Setup(string shellId)
+    {
+        _shellId = shellId;
+        Directory.CreateDirectory(AppPaths.ShellDir(shellId));
+        _logPath = AppPaths.LogFile(shellId);
+        TrimLog();
+        HostInfo.SaveCurrentProcess(shellId);
+        _writeLogImmediately = AppSettings.Load().WriteLogImmediately;
+    }
+
+    private static void MainLoop(string shellId, IPtySession pty)
+    {
+        _pty = pty;
         new Thread(ReadPtyLoop) { IsBackground = true }.Start();
         new Thread(WriteInputLoop) { IsBackground = true }.Start();
         new Thread(WaitExitLoop) { IsBackground = true }.Start();
@@ -193,7 +212,7 @@ public static class ShellHostProc
         }
     }
 
-    // No orphaned shells: if no window is connected and the associated window process is gone (pid + start time must both match to count as alive), this shell ends itself. The folder stays for resurrection from the settings window.
+    // No orphaned shells, ever: the windows\*.json files are the single source of truth for which window owns which shell. When no client is connected, this shell finds its parent window there (cached id first, full scan on miss) and verifies that window's owner process is alive (pid + start time must both match). No referencing window, or a dead owner → self-terminate. The folder stays for resurrection.
     private static void LivenessLoop()
     {
         while (true)
@@ -207,11 +226,54 @@ public static class ShellHostProc
             {
                 continue;
             }
-            if (_windowPid != 0 && HostInfo.ProcessAlive(_windowPid, _windowStartTicks))
+            var windowId = FindParentWindowId();
+            if (windowId == null)
+            {
+                Terminate("no window file references this shell — exiting to avoid an orphan");
+            }
+            var state = WindowState.Load(windowId!);
+            if (state.OwnerPid != 0 && HostInfo.ProcessAlive(state.OwnerPid, state.OwnerStartTicks))
             {
                 continue;
             }
-            Terminate("window is gone — exiting to avoid an orphaned shell");
+            Terminate($"parent window {windowId} has no live owner — exiting to avoid an orphan");
+        }
+    }
+
+    private static string? FindParentWindowId()
+    {
+        if (_windowId is { } cached && WindowListsShell(cached))
+        {
+            return cached;
+        }
+        try
+        {
+            foreach (var file in Directory.GetFiles(AppPaths.WindowsDir, "*.json"))
+            {
+                var id = Path.GetFileNameWithoutExtension(file);
+                if (WindowListsShell(id))
+                {
+                    _windowId = id;
+                    return id;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("shellhost", "window scan failed: " + ex.Message);
+        }
+        return null;
+    }
+
+    private static bool WindowListsShell(string windowId)
+    {
+        try
+        {
+            return File.Exists(AppPaths.WindowFile(windowId)) && WindowState.Load(windowId).Shells.Contains(_shellId);
+        }
+        catch
+        {
+            return false;
         }
     }
 

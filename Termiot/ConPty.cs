@@ -6,7 +6,17 @@ using Microsoft.Win32.SafeHandles;
 
 namespace Termiot;
 
-public sealed class ConPty : IDisposable
+// What the shell host needs from a terminal session, regardless of whether it created the pty itself (ConPty) or received it via default-terminal handoff (HandoffPty).
+public interface IPtySession : IDisposable
+{
+    FileStream Output { get; }
+    FileStream Input { get; }
+    void Resize(int cols, int rows);
+    int WaitForExit();
+    void Kill();
+}
+
+public sealed class ConPty : IPtySession
 {
     private IntPtr _hpc;
     private IntPtr _hProcess;

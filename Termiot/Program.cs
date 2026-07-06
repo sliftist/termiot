@@ -17,6 +17,25 @@ public static class Program
             AppLog.InstallCrashHandlers(null);
             return SelfTest.Run();
         }
+        if (args.Contains("-Embedding") || args.Contains("/Embedding"))
+        {
+            AppLog.InstallCrashHandlers(null);
+            return TerminalHandoffServer.Run();
+        }
+        if (args.Length >= 7 && args[0] == "--handoffhost")
+        {
+            AppLog.InstallCrashHandlers(null);
+            try
+            {
+                ShellHostProc.RunHandoff(args[1], long.Parse(args[2]), long.Parse(args[3]), long.Parse(args[4]), long.Parse(args[5]), long.Parse(args[6]));
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("shellhost", ex.ToString());
+                return 1;
+            }
+            return 0;
+        }
         if (args.Length >= 2 && args[0] == "--shellhost")
         {
             AppLog.InstallCrashHandlers(null);
@@ -33,11 +52,15 @@ public static class Program
         }
 
         string? windowId = null;
+        bool forceResume = false;
         if (args.Length >= 2 && args[0] == "--window")
         {
             windowId = args[1];
-            if (!TryClaimWindow(windowId))
+            forceResume = args.Contains("--resume");
+            bool takeover = args.Contains("--takeover");
+            if (!TryClaimWindow(windowId) && !(takeover && TakeOverWindow(windowId)))
             {
+                AppLog.Write("ui", $"window {windowId} claim failed (owner alive or claim race lost) — exiting");
                 return 0;
             }
         }
@@ -69,7 +92,7 @@ public static class Program
         AppLog.InstallCrashHandlers(app);
         try
         {
-            return app.Run(new MainWindow(windowId, WindowState.Load(windowId)));
+            return app.Run(new MainWindow(windowId, WindowState.Load(windowId), forceResume));
         }
         catch (Exception ex)
         {
@@ -87,6 +110,30 @@ public static class Program
     public static string NewShellId()
     {
         return DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + "-" + Guid.NewGuid().ToString("N")[..4];
+    }
+
+    // Rebuild-and-reload: the freshly built process kills the window's current (verified alive, pid + start time matched) owner and takes its place. Only used after a successful build, so a failed build never costs the running window.
+    private static bool TakeOverWindow(string windowId)
+    {
+        const int OwnerExitTimeoutMs = 5000;
+        var state = WindowState.Load(windowId);
+        if (state.OwnerPid != 0 && HostInfo.ProcessAlive(state.OwnerPid, state.OwnerStartTicks))
+        {
+            try
+            {
+                Process.GetProcessById(state.OwnerPid).Kill();
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("ui", $"takeover kill failed for {windowId}: {ex.Message}");
+            }
+            var deadline = Environment.TickCount64 + OwnerExitTimeoutMs;
+            while (HostInfo.ProcessAlive(state.OwnerPid, state.OwnerStartTicks) && Environment.TickCount64 < deadline)
+            {
+                Thread.Sleep(100);
+            }
+        }
+        return TryClaimWindow(windowId);
     }
 
     private static bool TryClaimWindow(string windowId)

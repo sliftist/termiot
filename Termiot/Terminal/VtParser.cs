@@ -27,6 +27,8 @@ public sealed class VtParser
     public Action<byte[]>? OnRespond;
     // Fired when a termiot command marker (APC termiot-cmd:<base64>) is encountered — during live output and during log replay alike, so command/output structure survives restarts.
     public Action<string>? OnCommandMarker;
+    // ConPTY requests win32-input-mode (?9001) at session start; when granted, keyboard input is sent as full Win32 key records so modifier distinctions (Ctrl+Enter vs Enter) survive.
+    public Action<bool>? OnWin32InputMode;
 
     private const string CommandMarkerPrefix = "termiot-cmd:";
 
@@ -36,7 +38,12 @@ public sealed class VtParser
     private readonly StringBuilder _raw = new();
     private readonly StringBuilder _csiParams = new();
     private char _csiPrefix;
+    private char _strIntroducer;
     private readonly StringBuilder _osc = new();
+    // Rolling window of recently printed text, kept as implementation context for recorded unhandled sequences.
+    private const int ContextChars = 80;
+    private readonly char[] _recentText = new char[ContextChars];
+    private int _recentPos;
 
     public VtParser(TermScreen screen)
     {
@@ -79,6 +86,7 @@ public sealed class VtParser
                 ProcessEscape(c);
                 break;
             case State.Charset:
+                RecordUnhandled($"ESC charset {c}");
                 Finish(null, "Designate character set");
                 break;
             case State.Csi:
@@ -166,9 +174,24 @@ public sealed class VtParser
                 if (c >= ' ')
                 {
                     _s.Print(c);
+                    _recentText[_recentPos++ % ContextChars] = c;
                 }
                 break;
         }
+    }
+
+    private void RecordUnhandled(string key)
+    {
+        var context = new StringBuilder(ContextChars);
+        for (int i = 0; i < ContextChars; i++)
+        {
+            var c = _recentText[(_recentPos + i) % ContextChars];
+            if (c != '\0')
+            {
+                context.Append(c);
+            }
+        }
+        EscapeRecorder.Record(key, Visualize(_raw), context.ToString());
     }
 
     private void ProcessEscape(char c)
@@ -188,6 +211,7 @@ public sealed class VtParser
             case 'X':
             case '^':
             case '_':
+                _strIntroducer = c;
                 _osc.Clear();
                 _state = State.Str;
                 break;
@@ -224,6 +248,7 @@ public sealed class VtParser
                 Finish(null, "Keypad mode");
                 break;
             default:
+                RecordUnhandled($"ESC {c}");
                 Finish(null, "Escape sequence");
                 break;
         }
@@ -413,8 +438,44 @@ public sealed class VtParser
                         SetPrivateMode(mode, final == 'h');
                     }
                 }
+                else
+                {
+                    RecordUnhandled($"CSI {_csiParams} {final}");
+                }
+                break;
+            default:
+                RecordUnhandled(NormalizedCsiKey(final));
                 break;
         }
+    }
+
+    // Positional numeric parameters are collapsed to "n" so counts and coordinates don't create one entry per value; mode-identifying parameters (h/l) keep their numbers via the dedicated call sites.
+    private string NormalizedCsiKey(char final)
+    {
+        var sb = new StringBuilder("CSI ");
+        if (_csiPrefix != '\0')
+        {
+            sb.Append(_csiPrefix);
+        }
+        bool inNumber = false;
+        foreach (var c in _csiParams.ToString())
+        {
+            if (c >= '0' && c <= '9')
+            {
+                if (!inNumber)
+                {
+                    sb.Append('n');
+                    inNumber = true;
+                }
+            }
+            else
+            {
+                inNumber = false;
+                sb.Append(c);
+            }
+        }
+        sb.Append(' ').Append(final);
+        return sb.ToString();
     }
 
     private void SetPrivateMode(int mode, bool on)
@@ -423,6 +484,9 @@ public sealed class VtParser
         {
             case 25:
                 _s.CursorVisible = on;
+                break;
+            case 9001:
+                OnWin32InputMode?.Invoke(on);
                 break;
             case 47:
                 _s.UseAltScreen(on, false);
@@ -452,6 +516,9 @@ public sealed class VtParser
                     _s.RestoreCursor();
                 }
                 break;
+            default:
+                RecordUnhandled($"CSI ?{mode} {(on ? 'h' : 'l')}");
+                break;
         }
     }
 
@@ -474,6 +541,9 @@ public sealed class VtParser
                 case 1:
                     _s.CurFlags |= CellFlags.Bold;
                     break;
+                case 2:
+                    _s.CurFlags |= CellFlags.Dim;
+                    break;
                 case 4:
                     _s.CurFlags |= CellFlags.Underline;
                     break;
@@ -481,7 +551,7 @@ public sealed class VtParser
                     _s.CurFlags |= CellFlags.Reverse;
                     break;
                 case 22:
-                    _s.CurFlags &= ~CellFlags.Bold;
+                    _s.CurFlags &= ~(CellFlags.Bold | CellFlags.Dim);
                     break;
                 case 24:
                     _s.CurFlags &= ~CellFlags.Underline;
@@ -520,6 +590,9 @@ public sealed class VtParser
                     break;
                 case >= 100 and <= 107:
                     _s.CurBg = Palette.Color16(v - 100 + 8);
+                    break;
+                default:
+                    RecordUnhandled($"SGR {v}");
                     break;
             }
         }
@@ -564,6 +637,13 @@ public sealed class VtParser
             _state = State.Ground;
             return;
         }
+        RecordUnhandled(_strIntroducer switch
+        {
+            'P' => "DCS string",
+            'X' => "SOS string",
+            '^' => "PM string",
+            _ => "APC string",
+        });
         Finish(null, "Control string");
     }
 
@@ -581,6 +661,10 @@ public sealed class VtParser
         else
         {
             int.TryParse(body, out code);
+        }
+        if (code is not (0 or 1 or 2))
+        {
+            RecordUnhandled($"OSC {code}");
         }
         if (ShowEscapes)
         {

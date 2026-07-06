@@ -9,6 +9,7 @@ public sealed class TabInfo
     public string Id { get; set; } = "";
     public string Cwd { get; set; } = "";
     public string Title { get; set; } = "cmd";
+    public string ForcedTitle { get; set; } = "";
 }
 
 // Per-shell metadata stored inside the shell's own folder (shells\<id>\shell.json), written by the window that watches it.
@@ -16,6 +17,8 @@ public sealed class ShellInfo
 {
     public string Cwd { get; set; } = "";
     public string Title { get; set; } = "cmd";
+    // A user-renamed tab keeps this title permanently (over both the automatic folder+command title and process-set titles) until cleared.
+    public string ForcedTitle { get; set; } = "";
 
     public static ShellInfo? Load(string shellId)
     {
@@ -39,7 +42,7 @@ public sealed class ShellInfo
         try
         {
             Directory.CreateDirectory(AppPaths.ShellDir(info.Id));
-            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title }, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle }, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(AppPaths.ShellInfoFile(info.Id), json);
         }
         catch (Exception ex)
@@ -168,7 +171,7 @@ public sealed class WindowState
                 continue;
             }
             var info = ShellInfo.Load(id) ?? new ShellInfo();
-            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title });
+            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle });
         }
         return tabs;
     }

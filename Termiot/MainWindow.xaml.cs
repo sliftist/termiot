@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
@@ -20,8 +21,9 @@ public partial class MainWindow : Window
     private const string DefaultTabTitle = "cmd";
     private const int StateSaveDebounceMs = 2000;
     private const int RenderTickMs = 16;
-    private const string ShellDragFormat = "termiot-shell-id";
     private const double DragStartThresholdPx = 6;
+    // Identifies our WM_COPYDATA adoption messages; anything else is ignored.
+    private static readonly IntPtr AdoptMessageId = (IntPtr)0x7E541071;
     // The old watcher's Detach must land before the new watcher dials the pipe, or the connect attempt spawns a duplicate host.
     private const int DragHandoffDelayMs = 400;
     private static readonly Regex PromptRegex = new(@"^([A-Za-z]:\\[^<>|?*""]*?)>\s*$", RegexOptions.Compiled);
@@ -35,14 +37,20 @@ public partial class MainWindow : Window
         public ShellSession? Session;
         public bool Dead;
         public int Dirty;
+        public bool Win32Input;
         public bool LoggedFirstRender;
         public string PendingInput = "";
         public string LastCommand = "";
         public bool Running;
         // (command, absolute line index) pairs from termiot-cmd markers; guarded by Screen.Sync (appended during parsing, read for LLM context).
         public List<(string Cmd, int Line)> CommandMarks = new();
+        // Set when the shell process names itself via OSC title sequences; empty = use our automatic "folder + command" title.
+        public string CustomTitle = "";
         public Border Header = null!;
         public TextBlock HeaderText = null!;
+        public TextBox TitleEditor = null!;
+        public TextBlock AutoResumeButton = null!;
+        public TextBlock RevertTitleButton = null!;
     }
 
     private readonly string _windowId;
@@ -55,23 +63,25 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _renderTimer;
     private List<(int Line, int Col)> _matches = new();
     private int _matchIndex = -1;
-    private List<string>? _cycleMatches;
-    private int _cyclePos = -1;
-    private string _cyclePrefix = "";
     private const int YarnNamesCacheMs = 5000;
 
-    private List<string>? _tabCandidates;
-    private int _tabPos = -1;
-    private string _tabBase = "";
-    private string? _suggestion;
     private string _yarnNamesCwd = "";
     private long _yarnNamesTick;
     private List<string> _yarnNames = new();
     private readonly LlmPredictor _predictor;
     private readonly DispatcherTimer _llmTimer;
     private readonly List<TextBlock> _suggestionRows = new();
-    private int _llmCycleIndex = -1;
-    private string _llmBase = "";
+    // The unified suggestion list shown under the input: LLM predictions when the LLM toggle is on, otherwise the regular candidates (history, yarn, filesystem). Tab walks _candIndex through the whole list; _candWindowStart is the rolling display window.
+    private List<string> _candidates = new();
+    private int _candIndex = -1;
+    private int _candWindowStart;
+    private string _candBase = "";
+
+    private const int RawKeyLogMaxChars = 400;
+    private string _rawKeyLog = "";
+    private const int WindowFileSyncMs = 15000;
+    // Gives the dying host time to release its pipe name and exit before the replacement spawns.
+    private const int ShellRestartDelayMs = 500;
 
     private const int LlmDebounceMs = 400;
     private const int LlmMaxPairs = 20;
@@ -79,12 +89,15 @@ public partial class MainWindow : Window
     private const int LlmMaxOutputLines = 40;
     private bool _settingInputText;
     private bool _closedBecauseEmpty;
+    private TextBox? _activeTitleEditor;
+    // Checkbox Checked/Unchecked handlers fire from the ctor's programmatic IsChecked assignments; side effects (saving, opening windows) must wait for real user interaction.
+    private readonly bool _uiReady;
     private Point _dragStart;
     private TabVm? _dragCandidate;
-    private bool _dragCancelled;
-    private bool _dropWasSelf;
+    private TabVm? _draggingVm;
+    private DragGhost? _dragGhost;
 
-    public MainWindow(string windowId, Termiot.WindowState state)
+    public MainWindow(string windowId, Termiot.WindowState state, bool forceResume = false)
     {
         _windowId = windowId;
         InitializeComponent();
@@ -110,24 +123,39 @@ public partial class MainWindow : Window
         _renderTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(RenderTickMs) };
         _renderTimer.Tick += (_, _) => RenderDirtyTabs();
         _renderTimer.Start();
+        // The window file is the single source of truth for window↔shell ownership; re-reading it periodically picks up shells assigned to this window by other processes even if their handoff message was lost.
+        var syncTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(WindowFileSyncMs) };
+        syncTimer.Tick += (_, _) => SyncTabsFromWindowFile();
+        syncTimer.Start();
 
         _predictor = new LlmPredictor(_settings);
-        _predictor.Updated += () => Dispatcher.BeginInvoke(UpdateLlmUi);
+        _predictor.Updated += () => Dispatcher.BeginInvoke(() =>
+        {
+            if (_settings.LlmEnabled)
+            {
+                _candidates = _predictor.Suggestions.ToList();
+                _candIndex = -1;
+                _candWindowStart = 0;
+            }
+            UpdateLlmUi();
+        });
         _llmTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(LlmDebounceMs) };
         _llmTimer.Tick += (_, _) =>
         {
             _llmTimer.Stop();
             RequestLlmPrediction();
         };
+        BuildTimeText.Text = BuildInfo.Display;
         LlmToggle.IsChecked = _settings.LlmEnabled;
         MultiToggle.IsChecked = _settings.LlmMultiComplete;
-        ApplyLlmUi();
         RawToggle.IsChecked = _settings.RawInput;
+        _uiReady = true;
+        ApplyLlmUi();
         ApplyInputMode();
         // This is a command line: typing must always land in it. Keyboard focus is denied to everything except the input box, the search box, and the terminal in raw-keys mode — buttons and tabs still work from mouse clicks, which don't need keyboard focus.
         PreviewGotKeyboardFocus += (_, e) =>
         {
-            if (ReferenceEquals(e.NewFocus, InputBox) || ReferenceEquals(e.NewFocus, SearchBox) || (RawMode && ReferenceEquals(e.NewFocus, Term)))
+            if (ReferenceEquals(e.NewFocus, InputBox) || ReferenceEquals(e.NewFocus, SearchBox) || (RawMode && ReferenceEquals(e.NewFocus, Term)) || (_activeTitleEditor != null && ReferenceEquals(e.NewFocus, _activeTitleEditor)))
             {
                 return;
             }
@@ -135,15 +163,19 @@ public partial class MainWindow : Window
             Dispatcher.BeginInvoke(DispatcherPriority.Input, FocusInput);
         };
         Activated += (_, _) => Dispatcher.BeginInvoke(DispatcherPriority.Input, FocusInput);
+        FocusSelectAll.Attach(SearchBox);
         Term.CellSizeChanged += OnCellSizeChanged;
         Term.KeyDown += Term_KeyDown;
         Term.TextInput += Term_TextInput;
         PreviewKeyDown += Window_PreviewKeyDown;
         LocationChanged += (_, _) => ScheduleSave();
         SizeChanged += (_, _) => ScheduleSave();
-        AllowDrop = true;
-        DragOver += Window_DragOver;
-        Drop += Window_Drop;
+        // Tab adoption between our windows arrives as WM_COPYDATA — a private channel, no OLE drag-drop involved.
+        SourceInitialized += (_, _) =>
+        {
+            var source = System.Windows.Interop.HwndSource.FromHwnd(new System.Windows.Interop.WindowInteropHelper(this).Handle);
+            source?.AddHook(WndProc);
+        };
         Closing += (_, _) =>
         {
             if (_closedBecauseEmpty)
@@ -166,7 +198,7 @@ public partial class MainWindow : Window
         {
             bool alive = HostInfo.IsShellAlive(info.Id);
             var vm = CreateTab(info, activate: false, start: alive);
-            if (!alive && _settings.AutoResumeShells)
+            if (!alive && (_settings.AutoResumeShells || forceResume))
             {
                 ResumeTab(vm, runAutoResumeCommand: true);
             }
@@ -187,21 +219,39 @@ public partial class MainWindow : Window
         return new TabInfo { Id = Program.NewShellId(), Cwd = cwd, Title = DefaultTabTitle };
     }
 
-    private TabVm CreateTab(TabInfo info, bool activate, bool start = true)
+    private TabVm CreateTab(TabInfo info, bool activate, bool start = true, bool insertAfterActive = false, int insertIndex = -1)
     {
         var screen = new TermScreen(120, 30);
         var parser = new VtParser(screen) { ShowEscapes = _settings.ShowEscapeSequences };
         var vm = new TabVm { Info = info, Screen = screen, Parser = parser };
         parser.OnTitle = title => Dispatcher.BeginInvoke(() =>
         {
-            vm.Info.Title = string.IsNullOrWhiteSpace(title) ? DefaultTabTitle : title;
+            title = title.Trim();
+            // cmd constantly re-announces its own path as the title; only deliberate titles (e.g. the `title` command) count as custom.
+            vm.CustomTitle = title.Length == 0 || title.EndsWith("cmd.exe", StringComparison.OrdinalIgnoreCase) ? "" : title;
             RefreshTabTitle(vm);
-            ScheduleSave();
+            if (vm == Active)
+            {
+                UpdateWindowTitle();
+            }
         });
         parser.OnCommandMarker = cmd => vm.CommandMarks.Add((cmd, vm.Screen.ScrollbackCount + vm.Screen.CursorY));
+        parser.OnWin32InputMode = on =>
+        {
+            vm.Win32Input = on;
+            Dispatcher.BeginInvoke(() =>
+            {
+                RefreshTabTitle(vm);
+                if (vm == Active)
+                {
+                    UpdateWindowTitle();
+                }
+            });
+        };
         BuildTabHeader(vm);
         RefreshTabTitle(vm);
-        _tabs.Add(vm);
+        int index = insertIndex >= 0 ? Math.Clamp(insertIndex, 0, _tabs.Count) : insertAfterActive && _active >= 0 && _active < _tabs.Count ? _active + 1 : _tabs.Count;
+        _tabs.Insert(index, vm);
         if (start)
         {
             StartSession(vm);
@@ -210,17 +260,23 @@ public partial class MainWindow : Window
         ScheduleSave();
         if (activate)
         {
-            ActivateTab(_tabs.Count - 1);
+            ActivateTab(index);
         }
         return vm;
     }
 
     private void StartSession(TabVm vm)
     {
-        vm.Session = ShellSession.Create(vm.Info.Id, string.IsNullOrEmpty(vm.Info.Cwd) ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : vm.Info.Cwd, _windowId, vm.Screen, vm.Parser);
-        vm.Session.OutputReceived += () => Interlocked.Exchange(ref vm.Dirty, 1);
-        vm.Session.Exited += _ => Dispatcher.BeginInvoke(() =>
+        var session = ShellSession.Create(vm.Info.Id, string.IsNullOrEmpty(vm.Info.Cwd) ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : vm.Info.Cwd, _windowId, vm.Screen, vm.Parser);
+        vm.Session = session;
+        session.OutputReceived += () => Interlocked.Exchange(ref vm.Dirty, 1);
+        session.Exited += _ => Dispatcher.BeginInvoke(() =>
         {
+            // A stale Exited from a replaced session (e.g. after a shell restart) must not mark the new one dead.
+            if (vm.Session != session)
+            {
+                return;
+            }
             vm.Dead = true;
             if (vm == Active)
             {
@@ -228,7 +284,7 @@ public partial class MainWindow : Window
                 Term.RenderFrame();
             }
         });
-        vm.Session.Begin();
+        session.Begin();
         if (Term.Cols > 0)
         {
             lock (vm.Screen.Sync)
@@ -255,6 +311,40 @@ public partial class MainWindow : Window
         }
     }
 
+    // Kill the shell process, then treat the tab exactly like a freshly restored one: with an AUTORESUME.cmd present, either auto-resume it (setting on) or show the resume confirmation; without one, just start a new shell — same directory, full history via log replay.
+    private void RestartShell(TabVm vm)
+    {
+        vm.Session?.ShutdownHost();
+        vm.Session = null;
+        vm.Dead = false;
+        vm.Running = false;
+        RefreshTabTitle(vm);
+        Task.Delay(ShellRestartDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
+        {
+            if (vm.Session != null || !_tabs.Contains(vm))
+            {
+                return;
+            }
+            bool hasAutoResume = File.Exists(AppPaths.AutoResumeFile(vm.Info.Id));
+            if (hasAutoResume && _settings.AutoResumeShells)
+            {
+                ResumeTab(vm, runAutoResumeCommand: true);
+                return;
+            }
+            if (!hasAutoResume)
+            {
+                StartSession(vm);
+                RefreshTabTitle(vm);
+            }
+            if (vm == Active)
+            {
+                UpdateResumeOverlay();
+                ApplyInputMode();
+                UpdateWindowTitle();
+            }
+        }));
+    }
+
     private void ResumeTab(TabVm vm, bool runAutoResumeCommand)
     {
         if (vm.Session != null)
@@ -262,16 +352,9 @@ public partial class MainWindow : Window
             return;
         }
         StartSession(vm);
-        var autoResumePath = AppPaths.AutoResumeFile(vm.Info.Id);
-        if (runAutoResumeCommand && File.Exists(autoResumePath) && vm.Session is { } session)
+        if (runAutoResumeCommand)
         {
-            // The script executes via its path; input is queued in the pty, so cmd runs it as soon as its prompt is ready.
-            string command = $"\"{autoResumePath}\"";
-            session.SendCommandMarker(command);
-            session.SendText(command + "\r");
-            vm.LastCommand = command;
-            vm.Running = true;
-            RefreshTabTitle(vm);
+            RunAutoResumeCommand(vm);
         }
         if (vm == Active)
         {
@@ -279,6 +362,27 @@ public partial class MainWindow : Window
             ApplyInputMode();
             UpdateWindowTitle();
             FocusInput();
+        }
+    }
+
+    // Runs the shell's AUTORESUME.cmd by sending its path; input is queued in the pty, so cmd executes it as soon as its prompt is ready.
+    private void RunAutoResumeCommand(TabVm vm)
+    {
+        var autoResumePath = AppPaths.AutoResumeFile(vm.Info.Id);
+        if (vm.Dead || !File.Exists(autoResumePath) || vm.Session is not { } session)
+        {
+            return;
+        }
+        string command = $"\"{autoResumePath}\"";
+        session.SendCommandMarker(command);
+        session.SendText(command + "\r");
+        vm.LastCommand = command;
+        vm.Running = true;
+        RefreshTabTitle(vm);
+        if (vm == Active)
+        {
+            UpdateWindowTitle();
+            Term.ScrollToBottom();
         }
     }
 
@@ -319,7 +423,7 @@ public partial class MainWindow : Window
     }
 
     // Used by the settings window's shell list and by cross-window tab drops. Works for both live shells (connects to the running host) and dead ones (ShellSession spawns a fresh host in the saved cwd and the log replay restores the scrollback).
-    public void AddShellTab(string shellId)
+    public void AddShellTab(string shellId, int insertIndex = -1)
     {
         for (int i = 0; i < _tabs.Count; i++)
         {
@@ -330,7 +434,7 @@ public partial class MainWindow : Window
             }
         }
         var info = ShellInfo.Load(shellId) ?? new ShellInfo();
-        CreateTab(new TabInfo { Id = shellId, Cwd = info.Cwd, Title = info.Title }, activate: true);
+        CreateTab(new TabInfo { Id = shellId, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle }, activate: true, insertIndex: insertIndex);
     }
 
     private void BuildTabHeader(TabVm vm)
@@ -341,6 +445,80 @@ public partial class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
             MaxWidth = 260,
             TextTrimming = TextTrimming.CharacterEllipsis,
+        };
+        var editor = new TextBox
+        {
+            Visibility = Visibility.Collapsed,
+            MinWidth = 100,
+            Background = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x1E)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE8, 0xE8, 0xE8)),
+            CaretBrush = new SolidColorBrush(Color.FromRgb(0xE8, 0xE8, 0xE8)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x55, 0x55, 0x55)),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        editor.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter)
+            {
+                e.Handled = true;
+                EndTitleEdit(vm, commit: true);
+            }
+            else if (e.Key == Key.Escape)
+            {
+                e.Handled = true;
+                EndTitleEdit(vm, commit: false);
+            }
+        };
+        editor.LostKeyboardFocus += (_, _) =>
+        {
+            if (editor.Visibility == Visibility.Visible)
+            {
+                EndTitleEdit(vm, commit: true);
+            }
+        };
+        vm.TitleEditor = editor;
+        var revertTitle = new TextBlock
+        {
+            Text = "⟲",
+            Foreground = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(6, 0, 0, 0),
+            Cursor = Cursors.Hand,
+            Visibility = Visibility.Collapsed,
+            ToolTip = "Revert to the automatic title (folder + command)",
+        };
+        revertTitle.MouseLeftButtonDown += (_, e) =>
+        {
+            e.Handled = true;
+            vm.Info.ForcedTitle = "";
+            vm.CustomTitle = "";
+            ScheduleSave();
+            EndTitleEdit(vm, commit: false);
+        };
+        vm.RevertTitleButton = revertTitle;
+        // Indicator only — shows that this shell will auto-resume via AUTORESUME.cmd (tooltip shows the command); deliberately not clickable.
+        var autoRun = new TextBlock
+        {
+            Text = "⏻",
+            Foreground = new SolidColorBrush(Color.FromRgb(0x6F, 0xC9, 0x6F)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 0, 0),
+            Visibility = Visibility.Collapsed,
+        };
+        vm.AutoResumeButton = autoRun;
+        var refresh = new TextBlock
+        {
+            Text = "↻",
+            Foreground = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 0, 0),
+            Cursor = Cursors.Hand,
+            ToolTip = "Restart shell (Alt+Pause) — same directory, keeps history",
+        };
+        refresh.MouseLeftButtonDown += (_, e) =>
+        {
+            e.Handled = true;
+            RestartShell(vm);
         };
         var close = new TextBlock
         {
@@ -357,6 +535,10 @@ public partial class MainWindow : Window
         };
         var panel = new StackPanel { Orientation = Orientation.Horizontal };
         panel.Children.Add(text);
+        panel.Children.Add(editor);
+        panel.Children.Add(revertTitle);
+        panel.Children.Add(autoRun);
+        panel.Children.Add(refresh);
         panel.Children.Add(close);
         var border = new Border
         {
@@ -367,6 +549,13 @@ public partial class MainWindow : Window
         };
         border.MouseLeftButtonDown += (_, e) =>
         {
+            if (e.ClickCount == 2)
+            {
+                e.Handled = true;
+                _dragCandidate = null;
+                StartTitleEdit(vm);
+                return;
+            }
             int index = _tabs.IndexOf(vm);
             if (index >= 0)
             {
@@ -377,6 +566,11 @@ public partial class MainWindow : Window
         };
         border.MouseMove += (_, e) =>
         {
+            if (_draggingVm == vm && e.LeftButton == MouseButtonState.Pressed)
+            {
+                OnTabDragMove(e);
+                return;
+            }
             if (_dragCandidate != vm || e.LeftButton != MouseButtonState.Pressed)
             {
                 return;
@@ -385,41 +579,196 @@ public partial class MainWindow : Window
             if (Math.Abs(pos.X - _dragStart.X) > DragStartThresholdPx || Math.Abs(pos.Y - _dragStart.Y) > DragStartThresholdPx)
             {
                 _dragCandidate = null;
-                StartTabDrag(vm, border);
+                BeginTabDrag(vm, border);
             }
         };
-        border.MouseLeftButtonUp += (_, _) => _dragCandidate = null;
-        border.QueryContinueDrag += (_, e) =>
+        border.MouseLeftButtonUp += (_, e) =>
         {
-            if (e.EscapePressed)
+            _dragCandidate = null;
+            if (_draggingVm == vm)
             {
-                _dragCancelled = true;
+                e.Handled = true;
+                EndTabDrag(vm, border, e);
             }
+        };
+        border.LostMouseCapture += (_, _) =>
+        {
+            if (_draggingVm == vm)
+            {
+                CancelTabDrag(border);
+            }
+        };
+        border.MouseDown += (_, e) =>
+        {
+            if (e.ChangedButton == MouseButton.Middle)
+            {
+                e.Handled = true;
+                CloseTab(vm);
+            }
+        };
+        border.MouseRightButtonUp += (_, e) =>
+        {
+            e.Handled = true;
+            ShowTabContextMenu(vm, border);
         };
         vm.Header = border;
         vm.HeaderText = text;
     }
 
-    // Drag a tab: dropped on another Termiot window → that window adopts the shell and this one detaches (the shell process never notices beyond a watcher swap). Dropped on empty space → a new window process is created around the shell. Esc cancels.
-    private void StartTabDrag(TabVm vm, Border border)
+    // Tab dragging is entirely ours — mouse capture plus a ghost window, no OLE drag-drop, so nothing termiot-specific ever reaches other applications. Drop resolution: our own strip → reorder; another termiot window (found via WindowFromPoint + process identity) → adoption via WM_COPYDATA; anywhere else → a new window process around the shell. Esc cancels.
+    private void BeginTabDrag(TabVm vm, Border border)
     {
-        _dragCancelled = false;
-        _dropWasSelf = false;
-        var data = new DataObject(ShellDragFormat, vm.Info.Id);
-        var result = DragDrop.DoDragDrop(border, data, DragDropEffects.Move);
-        if (_dragCancelled || !_tabs.Contains(vm))
+        _draggingVm = vm;
+        _dragGhost = new DragGhost(vm.HeaderText.Inlines.OfType<Run>().FirstOrDefault()?.Text ?? vm.Info.Id);
+        _dragGhost.MoveToCursor(VisualTreeHelper.GetDpi(this).DpiScaleX);
+        _dragGhost.Show();
+        border.CaptureMouse();
+    }
+
+    private void OnTabDragMove(MouseEventArgs e)
+    {
+        _dragGhost?.MoveToCursor(VisualTreeHelper.GetDpi(this).DpiScaleX);
+        var pos = e.GetPosition(TabScroller);
+        if (pos.X >= 0 && pos.X <= TabScroller.ActualWidth && pos.Y >= 0 && pos.Y <= TabScroller.ActualHeight)
         {
+            ShowDropIndicator(TabInsertIndexAt(e.GetPosition(TabStrip).X));
+        }
+        else
+        {
+            DropIndicator.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void CancelTabDrag(Border border)
+    {
+        _draggingVm = null;
+        _dragGhost?.Close();
+        _dragGhost = null;
+        DropIndicator.Visibility = Visibility.Collapsed;
+        if (border.IsMouseCaptured)
+        {
+            border.ReleaseMouseCapture();
+        }
+    }
+
+    private void EndTabDrag(TabVm vm, Border border, MouseEventArgs e)
+    {
+        var stripPos = e.GetPosition(TabScroller);
+        bool overOwnStrip = stripPos.X >= 0 && stripPos.X <= TabScroller.ActualWidth && stripPos.Y >= 0 && stripPos.Y <= TabScroller.ActualHeight;
+        int stripIndex = TabInsertIndexAt(e.GetPosition(TabStrip).X);
+        CancelTabDrag(border);
+        GetCursorPos(out var cursor);
+        var rootUnderCursor = GetAncestor(WindowFromPoint(cursor), GA_ROOT);
+        var selfHwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+
+        if (rootUnderCursor == selfHwnd)
+        {
+            if (!overOwnStrip)
+            {
+                return;
+            }
+            int current = _tabs.IndexOf(vm);
+            int target = stripIndex;
+            if (target > current)
+            {
+                target--;
+            }
+            target = Math.Clamp(target, 0, _tabs.Count - 1);
+            if (target != current && current >= 0)
+            {
+                _tabs.RemoveAt(current);
+                _tabs.Insert(target, vm);
+                ActivateTab(target);
+                SaveState();
+            }
             return;
         }
-        if (result == DragDropEffects.Move)
+        if (rootUnderCursor != IntPtr.Zero && IsOtherTermiotWindow(rootUnderCursor))
         {
-            if (!_dropWasSelf)
+            if (SendAdoptMessage(rootUnderCursor, selfHwnd, vm.Info.Id, cursor))
             {
+                AppLog.Write("ui", $"drag: shell {vm.Info.Id} adopted by another window — detaching");
                 RemoveTabForMove(vm);
+            }
+            else
+            {
+                AppLog.Write("ui", $"drag: adoption message rejected for shell {vm.Info.Id}");
             }
             return;
         }
         SpawnWindowAroundShell(vm);
+    }
+
+    private static bool IsOtherTermiotWindow(IntPtr root)
+    {
+        try
+        {
+            GetWindowThreadProcessId(root, out uint pid);
+            if (pid == 0 || pid == Environment.ProcessId)
+            {
+                return false;
+            }
+            using var process = Process.GetProcessById((int)pid);
+            using var self = Process.GetCurrentProcess();
+            return string.Equals(process.ProcessName, self.ProcessName, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool SendAdoptMessage(IntPtr target, IntPtr source, string shellId, POINT cursor)
+    {
+        var payload = $"{shellId}|{cursor.X}|{cursor.Y}";
+        var bytes = Encoding.Unicode.GetBytes(payload);
+        var mem = Marshal.AllocHGlobal(bytes.Length);
+        try
+        {
+            Marshal.Copy(bytes, 0, mem, bytes.Length);
+            var cds = new COPYDATASTRUCT { dwData = AdoptMessageId, cbData = bytes.Length, lpData = mem };
+            return SendMessage(target, WM_COPYDATA, source, ref cds) != IntPtr.Zero;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(mem);
+        }
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg != WM_COPYDATA)
+        {
+            return IntPtr.Zero;
+        }
+        var cds = Marshal.PtrToStructure<COPYDATASTRUCT>(lParam);
+        if (cds.dwData != AdoptMessageId || cds.lpData == IntPtr.Zero)
+        {
+            return IntPtr.Zero;
+        }
+        var payload = Marshal.PtrToStringUni(cds.lpData, cds.cbData / 2) ?? "";
+        var parts = payload.Split('|');
+        if (parts.Length < 3 || !int.TryParse(parts[1], out int x) || !int.TryParse(parts[2], out int y))
+        {
+            return IntPtr.Zero;
+        }
+        handled = true;
+        string shellId = parts[0];
+        int insertIndex = -1;
+        try
+        {
+            var local = TabScroller.PointFromScreen(new Point(x, y));
+            if (local.X >= 0 && local.X <= TabScroller.ActualWidth && local.Y >= 0 && local.Y <= TabScroller.ActualHeight)
+            {
+                insertIndex = TabInsertIndexAt(TabStrip.PointFromScreen(new Point(x, y)).X);
+            }
+        }
+        catch
+        {
+        }
+        // Delayed so the source window's Detach lands before we dial the shell's pipe.
+        Task.Delay(DragHandoffDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(() => AddShellTab(shellId, insertIndex)));
+        return (IntPtr)1;
     }
 
     private void SpawnWindowAroundShell(TabVm vm)
@@ -436,8 +785,10 @@ public partial class MainWindow : Window
         };
         string newWindowId = Program.NewId();
         state.Save(newWindowId);
-        RemoveTabForMove(vm);
+        AppLog.Write("ui", $"drag-out: creating window {newWindowId} around shell {vm.Info.Id} at {state.X:0},{state.Y:0}");
+        // Spawn before detaching: the new window's claim and tab load only depend on the just-written file, and this ordering can't be broken by the source window closing itself when this was its last tab.
         Program.SpawnWindowProcess(newWindowId);
+        RemoveTabForMove(vm);
     }
 
     private void RemoveTabForMove(TabVm vm)
@@ -455,38 +806,63 @@ public partial class MainWindow : Window
         ActivateTab(Math.Clamp(index, 0, _tabs.Count - 1));
     }
 
-    private void Window_DragOver(object sender, DragEventArgs e)
+    // A green line drawn on an overlay canvas between the tabs — a pure preview; nothing in the strip moves until the drop.
+    private void ShowDropIndicator(int index)
     {
-        e.Effects = e.Data.GetDataPresent(ShellDragFormat) ? DragDropEffects.Move : DragDropEffects.None;
-        e.Handled = true;
+        double x = 0;
+        for (int i = 0; i < Math.Min(index, _tabs.Count); i++)
+        {
+            x += _tabs[i].Header.ActualWidth;
+        }
+        Canvas.SetLeft(DropIndicator, Math.Max(0, x - 1.5));
+        Canvas.SetTop(DropIndicator, 0);
+        DropIndicator.Height = Math.Max(10, TabStrip.ActualHeight);
+        DropIndicator.Visibility = Visibility.Visible;
     }
 
-    private void Window_Drop(object sender, DragEventArgs e)
+    private int TabInsertIndexAt(double x)
     {
-        if (e.Data.GetData(ShellDragFormat) is not string shellId)
+        double acc = 0;
+        for (int i = 0; i < _tabs.Count; i++)
         {
-            return;
+            double width = _tabs[i].Header.ActualWidth;
+            if (x < acc + width / 2)
+            {
+                return i;
+            }
+            acc += width;
         }
-        e.Handled = true;
-        e.Effects = DragDropEffects.Move;
-        if (_tabs.Any(t => t.Info.Id == shellId))
-        {
-            _dropWasSelf = true;
-            return;
-        }
-        // Delayed so the source window's Detach lands before we dial the shell's pipe.
-        Task.Delay(DragHandoffDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(() => AddShellTab(shellId)));
+        return _tabs.Count;
     }
 
     private void RefreshTabHeaders()
     {
         TabStrip.Children.Clear();
-        foreach (var vm in _tabs)
+        for (int i = 0; i < _tabs.Count; i++)
         {
-            // Dark theme: the selected tab goes DARKER (pure black, merging with the terminal below), not lighter.
-            vm.Header.Background = vm == Active ? Brushes.Black : Brushes.Transparent;
+            var vm = _tabs[i];
+            // Dark theme: the selected tab goes DARKER (pure black, merging with the terminal below), not lighter; inactive tabs alternate two shades so their boundaries are visible.
+            vm.Header.Background = vm == Active ? Brushes.Black : (i % 2 == 0 ? Brushes.Transparent : new SolidColorBrush(Color.FromRgb(0x2C, 0x2C, 0x2C)));
             TabStrip.Children.Add(vm.Header);
         }
+    }
+
+    private const double TabScrollStepPx = 160;
+
+    private void ScrollLeftBtn_Click(object sender, RoutedEventArgs e)
+    {
+        TabScroller.ScrollToHorizontalOffset(TabScroller.HorizontalOffset - TabScrollStepPx);
+    }
+
+    private void ScrollRightBtn_Click(object sender, RoutedEventArgs e)
+    {
+        TabScroller.ScrollToHorizontalOffset(TabScroller.HorizontalOffset + TabScrollStepPx);
+    }
+
+    private void TabScroller_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        e.Handled = true;
+        TabScroller.ScrollToHorizontalOffset(TabScroller.HorizontalOffset - e.Delta);
     }
 
     private void ActivateTab(int index)
@@ -500,12 +876,8 @@ public partial class MainWindow : Window
         Term.ShowTermCursor = RawMode && !vm.Dead && vm.Session != null;
         Term.Attach(vm.Screen);
         CwdLabel.Text = vm.Info.Cwd;
-        _cycleMatches = null;
-        _cyclePos = -1;
-        _tabCandidates = null;
-        _llmCycleIndex = -1;
         SetInputText(vm.PendingInput);
-        ScheduleLlmPrediction();
+        RefreshCandidates();
         UpdateResumeOverlay();
         UpdateWindowTitle();
         RefreshTabHeaders();
@@ -611,40 +983,150 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ShowTabContextMenu(TabVm vm, Border border)
+    {
+        var menu = new ContextMenu
+        {
+            Background = new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x2A)),
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE8, 0xE8, 0xE8)),
+            PlacementTarget = border,
+        };
+        var escapes = new MenuItem
+        {
+            Header = "Render escape sequences literally",
+            IsCheckable = true,
+            IsChecked = vm.Parser.ShowEscapes,
+        };
+        escapes.Click += (_, _) =>
+        {
+            vm.Parser.ShowEscapes = escapes.IsChecked;
+            RefreshTabTitle(vm);
+            if (vm == Active)
+            {
+                UpdateWindowTitle();
+            }
+        };
+        var rename = new MenuItem { Header = "Rename tab…" };
+        rename.Click += (_, _) => StartTitleEdit(vm);
+        menu.Items.Add(escapes);
+        menu.Items.Add(rename);
+        menu.IsOpen = true;
+    }
+
+    private void StartTitleEdit(TabVm vm)
+    {
+        vm.TitleEditor.Text = vm.Info.ForcedTitle.Length > 0 ? vm.Info.ForcedTitle : (vm.CustomTitle.Length > 0 ? vm.CustomTitle : LeafDir(vm.Info.Cwd));
+        vm.HeaderText.Visibility = Visibility.Collapsed;
+        vm.TitleEditor.Visibility = Visibility.Visible;
+        vm.RevertTitleButton.Visibility = Visibility.Visible;
+        _activeTitleEditor = vm.TitleEditor;
+        vm.TitleEditor.Focus();
+        vm.TitleEditor.SelectAll();
+    }
+
+    // Committing an empty title clears the forced title, same as the revert button.
+    private void EndTitleEdit(TabVm vm, bool commit)
+    {
+        vm.TitleEditor.Visibility = Visibility.Collapsed;
+        vm.HeaderText.Visibility = Visibility.Visible;
+        vm.RevertTitleButton.Visibility = Visibility.Collapsed;
+        _activeTitleEditor = null;
+        if (commit)
+        {
+            vm.Info.ForcedTitle = vm.TitleEditor.Text.Trim();
+            ScheduleSave();
+        }
+        RefreshTabTitle(vm);
+        if (vm == Active)
+        {
+            UpdateWindowTitle();
+        }
+        FocusInput();
+    }
+
+    private static string TitleFlags(TabVm vm)
+    {
+        return (vm.Parser.ShowEscapes ? "[esc] " : "") + (vm.Win32Input ? "[w32] " : "");
+    }
+
     private void RefreshTabTitle(TabVm vm)
     {
         var text = vm.HeaderText;
         text.Inlines.Clear();
-        string leaf = LeafDir(vm.Info.Cwd);
-        text.Inlines.Add(new Run(leaf.Length > 0 ? leaf : vm.Info.Title));
-        if (vm.LastCommand.Length > 0)
+        var flags = TitleFlags(vm);
+        if (flags.Length > 0)
         {
-            text.Inlines.Add(new Run("  " + vm.LastCommand)
+            text.Inlines.Add(new Run(flags) { Foreground = new SolidColorBrush(Color.FromRgb(0xFF, 0xB8, 0x6C)) });
+        }
+        if (vm.Info.ForcedTitle.Length > 0)
+        {
+            text.Inlines.Add(new Run(vm.Info.ForcedTitle));
+        }
+        else if (vm.CustomTitle.Length > 0)
+        {
+            text.Inlines.Add(new Run(vm.CustomTitle));
+        }
+        else
+        {
+            string leaf = LeafDir(vm.Info.Cwd);
+            text.Inlines.Add(new Run(leaf.Length > 0 ? leaf : vm.Info.Title));
+            if (vm.LastCommand.Length > 0)
             {
-                Foreground = new SolidColorBrush(vm.Running ? Color.FromArgb(0xFF, 0xCC, 0xCC, 0xCC) : Color.FromArgb(0x80, 0xCC, 0xCC, 0xCC)),
-            });
+                text.Inlines.Add(new Run("  " + vm.LastCommand)
+                {
+                    Foreground = new SolidColorBrush(vm.Running ? Color.FromArgb(0xFF, 0xCC, 0xCC, 0xCC) : Color.FromArgb(0x80, 0xCC, 0xCC, 0xCC)),
+                });
+            }
+        }
+        try
+        {
+            var autoResumePath = AppPaths.AutoResumeFile(vm.Info.Id);
+            if (File.Exists(autoResumePath))
+            {
+                vm.AutoResumeButton.Visibility = Visibility.Visible;
+                vm.AutoResumeButton.ToolTip = File.ReadAllText(autoResumePath).Trim();
+            }
+            else
+            {
+                vm.AutoResumeButton.Visibility = Visibility.Collapsed;
+            }
+        }
+        catch
+        {
+            vm.AutoResumeButton.Visibility = Visibility.Collapsed;
         }
     }
 
     private void UpdateWindowTitle()
     {
         var vm = Active;
+        string flags = vm != null ? TitleFlags(vm) : "";
+        if (vm?.Info.ForcedTitle is { Length: > 0 } forced)
+        {
+            Title = flags + forced;
+            return;
+        }
+        if (vm?.CustomTitle is { Length: > 0 } custom)
+        {
+            Title = flags + custom;
+            return;
+        }
         if (vm == null || vm.Info.Cwd.Length == 0)
         {
-            Title = "Termiot";
+            Title = flags + "Termiot";
             return;
         }
         if (vm.LastCommand.Length == 0)
         {
-            Title = vm.Info.Cwd;
+            Title = flags + vm.Info.Cwd;
         }
         else if (vm.Running)
         {
-            Title = $"{vm.Info.Cwd} — {vm.LastCommand}";
+            Title = $"{flags}{vm.Info.Cwd} — {vm.LastCommand}";
         }
         else
         {
-            Title = $"{vm.Info.Cwd} — ({vm.LastCommand})";
+            Title = $"{flags}{vm.Info.Cwd} — ({vm.LastCommand})";
         }
     }
 
@@ -678,6 +1160,34 @@ public partial class MainWindow : Window
         return double.IsFinite(v) ? v : null;
     }
 
+    private void SyncTabsFromWindowFile()
+    {
+        try
+        {
+            var state = Termiot.WindowState.Load(_windowId);
+            bool added = false;
+            foreach (var id in state.Shells)
+            {
+                if (_tabs.Any(t => t.Info.Id == id) || !Directory.Exists(AppPaths.ShellDir(id)))
+                {
+                    continue;
+                }
+                var info = ShellInfo.Load(id) ?? new ShellInfo();
+                CreateTab(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle }, activate: false, start: HostInfo.IsShellAlive(id));
+                added = true;
+                AppLog.Write("ui", $"sync: adopted shell {id} listed in window {_windowId}");
+            }
+            if (added)
+            {
+                SaveState();
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("ui", "window file sync failed: " + ex.Message);
+        }
+    }
+
     private void ScheduleSave()
     {
         _saveTimer.Stop();
@@ -707,10 +1217,15 @@ public partial class MainWindow : Window
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
-        if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.T)
+        if (key == Key.Escape && _draggingVm is { } dragging)
         {
             e.Handled = true;
-            CreateTab(NewTabInfo(Active?.Info.Cwd is { Length: > 0 } cwd ? cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), activate: true);
+            CancelTabDrag(dragging.Header);
+        }
+        else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.T)
+        {
+            e.Handled = true;
+            CreateTab(NewTabInfo(Active?.Info.Cwd is { Length: > 0 } cwd ? cwd : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), activate: true, insertAfterActive: true);
         }
         else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.F)
         {
@@ -718,6 +1233,19 @@ public partial class MainWindow : Window
             SearchBar.Visibility = Visibility.Visible;
             SearchBox.Focus();
             SearchBox.SelectAll();
+        }
+        else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.N)
+        {
+            e.Handled = true;
+            string newWindowId = Program.NewId();
+            new Termiot.WindowState
+            {
+                X = Finite(Left + 40),
+                Y = Finite(Top + 40),
+                Width = Finite(ActualWidth),
+                Height = Finite(ActualHeight),
+            }.Save(newWindowId);
+            Program.SpawnWindowProcess(newWindowId);
         }
         else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.W)
         {
@@ -736,6 +1264,28 @@ public partial class MainWindow : Window
         {
             e.Handled = true;
             ActivateTab((_active - 1 + _tabs.Count) % _tabs.Count);
+        }
+        else if (key == Key.Pause && (Keyboard.Modifiers & ModifierKeys.Alt) != 0)
+        {
+            e.Handled = true;
+            if (Active is { } restartVm)
+            {
+                RestartShell(restartVm);
+            }
+        }
+        else if (key == Key.Enter && Keyboard.Modifiers == ModifierKeys.None && Term.HasSelection)
+        {
+            // Enter with a selection copies it (like Ctrl+C) instead of sending anything — swallowed at window level so it works in editor and raw mode alike.
+            e.Handled = true;
+            try
+            {
+                Clipboard.SetText(Term.GetSelectedText());
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("ui", "clipboard copy failed: " + ex.Message);
+            }
+            Term.ClearSelection();
         }
         else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.C && Term.HasSelection)
         {
@@ -759,7 +1309,7 @@ public partial class MainWindow : Window
         else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.V && !SearchBox.IsKeyboardFocused)
         {
             // Editor mode: leave unhandled so the input box's native paste runs. Raw mode: send the clipboard text to the shell.
-            if (RawMode && Active is { Dead: false, Session: { } pasteSession })
+            if (RawMode && Active is { Dead: false, Session: { } pasteSession } pasteVm)
             {
                 e.Handled = true;
                 try
@@ -767,7 +1317,15 @@ public partial class MainWindow : Window
                     var text = Clipboard.GetText();
                     if (text.Length > 0)
                     {
-                        pasteSession.SendText(text);
+                        if (pasteVm.Win32Input)
+                        {
+                            pasteSession.SendInput(InputEncoder.EncodeWin32Text(text));
+                        }
+                        else
+                        {
+                            pasteSession.SendText(text);
+                        }
+                        LogRawKeystroke(text);
                         Term.ScrollToBottom();
                     }
                 }
@@ -777,9 +1335,9 @@ public partial class MainWindow : Window
                 }
             }
         }
-        else if (!RawMode && !SearchBox.IsKeyboardFocused && ShouldForwardToShell(key, Keyboard.Modifiers) && Active is { Dead: false, Session: { } session })
+        else if (!RawMode && !SearchBox.IsKeyboardFocused && ShouldForwardToShell(key, Keyboard.Modifiers) && Active is { Dead: false, Session: { } session } forwardVm)
         {
-            var encoded = InputEncoder.Encode(key, Keyboard.Modifiers);
+            var encoded = forwardVm.Win32Input ? InputEncoder.EncodeWin32Key(key, Keyboard.Modifiers) : InputEncoder.Encode(key, Keyboard.Modifiers);
             if (encoded != null)
             {
                 e.Handled = true;
@@ -813,17 +1371,51 @@ public partial class MainWindow : Window
         }
     }
 
+    // Raw keys mode sends keystrokes straight through — the cwd/LLM row and the suggestion panel are irrelevant there, so the whole apparatus disappears and no predictions run.
     private void ApplyInputMode()
     {
         bool raw = RawMode;
         EditorArea.Visibility = raw ? Visibility.Collapsed : Visibility.Visible;
-        CwdLabel.Visibility = raw ? Visibility.Collapsed : Visibility.Visible;
+        RawKeysText.Visibility = raw ? Visibility.Visible : Visibility.Collapsed;
+        CwdRow.Visibility = raw ? Visibility.Collapsed : Visibility.Visible;
+        SuggestionPanel.Visibility = raw ? Visibility.Collapsed : Visibility.Visible;
         Term.ShowTermCursor = raw && Active is { Dead: false, Session: not null };
         Term.RenderFrame();
     }
 
+    // Raw mode has no input echo of its own, so show what was sent — newest first, control bytes in caret notation (Ctrl+C → ^C, Escape → ^[, so an arrow key reads ^[[A), so chords are verifiable at a glance.
+    private void LogRawKeystroke(string sent)
+    {
+        var visualized = new StringBuilder(sent.Length);
+        foreach (var c in sent)
+        {
+            if (c < ' ')
+            {
+                visualized.Append('^').Append((char)(c + 0x40));
+            }
+            else if (c == '\x7f')
+            {
+                visualized.Append("^?");
+            }
+            else
+            {
+                visualized.Append(c);
+            }
+        }
+        _rawKeyLog = visualized + "  " + _rawKeyLog;
+        if (_rawKeyLog.Length > RawKeyLogMaxChars)
+        {
+            _rawKeyLog = _rawKeyLog[..RawKeyLogMaxChars];
+        }
+        RawKeysText.Text = _rawKeyLog;
+    }
+
     private void RawToggle_Changed(object sender, RoutedEventArgs e)
     {
+        if (!_uiReady)
+        {
+            return;
+        }
         _settings.RawInput = RawMode;
         _settings.Save();
         ApplyInputMode();
@@ -840,44 +1432,23 @@ public partial class MainWindow : Window
         {
             vm.PendingInput = InputBox.Text;
         }
-        _cycleMatches = null;
-        _cyclePos = -1;
-        _tabCandidates = null;
-        _llmCycleIndex = -1;
-        ScheduleLlmPrediction();
-        UpdateGhost();
+        RefreshCandidates();
     }
 
-    private void UpdateGhost()
+    // Recompute what the suggestion panel offers for the current input. LLM mode: keep showing the previous predictions until the (debounced) new ones land. Regular mode: candidates are cheap, compute synchronously.
+    private void RefreshCandidates()
     {
-        string text = InputBox.Text;
-        _suggestion = null;
-        if (text.Length > 0)
+        _candIndex = -1;
+        _candWindowStart = 0;
+        if (_settings.LlmEnabled)
         {
-            _suggestion = _history.Match(text).FirstOrDefault(m => !string.Equals(m, text, StringComparison.OrdinalIgnoreCase));
+            ScheduleLlmPrediction();
         }
-        if (_suggestion == null && text.Length > 0)
+        else
         {
-            int lastSpace = text.LastIndexOf(' ');
-            if (lastSpace >= 0 && text[..(lastSpace + 1)].Trim().Equals("yarn", StringComparison.OrdinalIgnoreCase) && Active?.Info.Cwd is { Length: > 0 } cwd)
-            {
-                string prefix = text[(lastSpace + 1)..];
-                var name = GetYarnNames(cwd).FirstOrDefault(n => n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && !n.Equals(prefix, StringComparison.OrdinalIgnoreCase));
-                if (name != null)
-                {
-                    _suggestion = text[..(lastSpace + 1)] + name;
-                }
-            }
+            _candidates = BuildTabCandidates(InputBox.Text);
         }
-        if (_suggestion == null)
-        {
-            GhostText.Text = "";
-            return;
-        }
-        InputBox.UpdateLayout();
-        var rect = InputBox.GetRectFromCharacterIndex(text.Length);
-        GhostText.Text = _suggestion.Substring(text.Length);
-        GhostText.Margin = new Thickness(double.IsInfinity(rect.X) || double.IsNaN(rect.X) ? 0 : rect.X, 0, 0, 0);
+        UpdateLlmUi();
     }
 
     private void SetInputText(string text)
@@ -890,7 +1461,6 @@ public partial class MainWindow : Window
         {
             vm.PendingInput = text;
         }
-        UpdateGhost();
     }
 
     private void InputBox_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -923,74 +1493,97 @@ public partial class MainWindow : Window
                         UpdateWindowTitle();
                     }
                     SetInputText("");
-                    _cycleMatches = null;
-                    _cyclePos = -1;
-                    _tabCandidates = null;
-                    _llmCycleIndex = -1;
                     Term.ScrollToBottom();
-                    ScheduleLlmPrediction();
+                    RefreshCandidates();
                 }
                 break;
             }
             case Key.Tab:
             {
                 e.Handled = true;
-                bool backwards = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
-                if (_settings.LlmEnabled && _predictor.Suggestions.Count > 0)
-                {
-                    CycleLlmSuggestions(backwards);
-                }
-                else if (!backwards)
-                {
-                    CycleTabCompletion();
-                }
+                CycleCandidates((Keyboard.Modifiers & ModifierKeys.Shift) != 0);
                 break;
             }
             case Key.Up:
             case Key.Down:
             {
                 e.Handled = true;
-                CycleHistory(e.Key == Key.Up);
+                CycleCandidates(e.Key == Key.Up);
                 break;
             }
         }
+    }
+
+    // Tab / Down move forward through the suggestion list, Shift+Tab / Up move back; the visible window of rows rolls along with the selection, and one step past the ends restores what the user had typed.
+    private void CycleCandidates(bool backwards)
+    {
+        if (_candidates.Count == 0)
+        {
+            return;
+        }
+        if (_candIndex == -1)
+        {
+            _candBase = InputBox.Text;
+        }
+        int slots = _candidates.Count + 1;
+        int current = _candIndex == -1 ? _candidates.Count : _candIndex;
+        current = ((current + (backwards ? -1 : 1)) % slots + slots) % slots;
+        _candIndex = current == _candidates.Count ? -1 : current;
+        if (_candIndex >= 0)
+        {
+            int rows = SuggestionRowCount();
+            if (_candIndex < _candWindowStart)
+            {
+                _candWindowStart = _candIndex;
+            }
+            else if (_candIndex >= _candWindowStart + rows)
+            {
+                _candWindowStart = _candIndex - rows + 1;
+            }
+        }
+        SetInputText(_candIndex == -1 ? _candBase : _candidates[_candIndex]);
+        UpdateLlmUi();
+    }
+
+    private int SuggestionRowCount()
+    {
+        return _settings.LlmMultiComplete ? Math.Clamp(_settings.MultiCompleteCount, 1, 100) : 1;
     }
 
     // --- LLM prediction ---
 
     private void LlmToggle_Changed(object sender, RoutedEventArgs e)
     {
+        if (!_uiReady)
+        {
+            return;
+        }
         _settings.LlmEnabled = LlmToggle.IsChecked.GetValueOrDefault();
         _settings.Save();
+        if (_settings.LlmEnabled && !_predictor.IsConfigured)
+        {
+            OpenSettings().SelectLlmTab();
+        }
         ApplyLlmUi();
-        if (_settings.LlmEnabled)
-        {
-            if (!_predictor.IsConfigured)
-            {
-                OpenSettings().SelectLlmTab();
-            }
-            ScheduleLlmPrediction();
-        }
-        else
-        {
-            _predictor.ClearSuggestions();
-        }
+        RefreshCandidates();
     }
 
     private void MultiToggle_Changed(object sender, RoutedEventArgs e)
     {
+        if (!_uiReady)
+        {
+            return;
+        }
         _settings.LlmMultiComplete = MultiToggle.IsChecked.GetValueOrDefault();
         _settings.Save();
         ApplyLlmUi();
-        ScheduleLlmPrediction();
+        RefreshCandidates();
     }
 
     private void ApplyLlmUi()
     {
-        bool on = _settings.LlmEnabled;
-        MultiToggle.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
-        SuggestionPanel.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
-        int rows = on ? (_settings.LlmMultiComplete ? 3 : 1) : 0;
+        SuggestionPanel.Visibility = RawMode ? Visibility.Collapsed : Visibility.Visible;
+        int rows = SuggestionRowCount();
         while (_suggestionRows.Count < rows)
         {
             var row = new TextBlock
@@ -1016,12 +1609,13 @@ public partial class MainWindow : Window
     private void UpdateLlmUi()
     {
         LlmCostText.Text = _settings.LlmRequestCount > 0 || _settings.LlmTotalCostUsd > 0 ? "$" + _settings.LlmTotalCostUsd.ToString("0.####") : "";
-        var suggestions = _predictor.Suggestions;
+        _candWindowStart = Math.Clamp(_candWindowStart, 0, Math.Max(0, _candidates.Count - _suggestionRows.Count));
         for (int i = 0; i < _suggestionRows.Count; i++)
         {
             var row = _suggestionRows[i];
-            row.Text = i < suggestions.Count ? suggestions[i] : " ";
-            bool selected = _llmCycleIndex == i;
+            int index = _candWindowStart + i;
+            row.Text = index < _candidates.Count ? _candidates[index] : " ";
+            bool selected = _candIndex == index && _candIndex >= 0;
             row.Background = selected ? new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x2A)) : Brushes.Transparent;
             row.Foreground = new SolidColorBrush(selected ? Color.FromRgb(0xE8, 0xE8, 0xE8) : Color.FromRgb(0x8A, 0x8A, 0x8A));
         }
@@ -1043,35 +1637,12 @@ public partial class MainWindow : Window
         {
             return;
         }
-        var (messages, display) = BuildLlmContext(vm, InputBox.Text, _settings.LlmMultiComplete);
-        _predictor.Request(messages, display, _settings.LlmMultiComplete);
+        int count = SuggestionRowCount();
+        var (messages, display) = BuildLlmContext(vm, InputBox.Text, count);
+        _predictor.Request(messages, display, count);
     }
 
-    // Tab with LLM suggestions cycles through them, replacing the whole input (the model may rewrite the entire command); one extra step returns to what the user had typed.
-    private void CycleLlmSuggestions(bool backwards)
-    {
-        var suggestions = _predictor.Suggestions;
-        if (suggestions.Count == 0)
-        {
-            return;
-        }
-        if (_llmCycleIndex == -1 && !backwards)
-        {
-            _llmBase = InputBox.Text;
-        }
-        int slots = suggestions.Count + 1;
-        int current = _llmCycleIndex == -1 ? suggestions.Count : _llmCycleIndex;
-        current = ((current + (backwards ? -1 : 1)) % slots + slots) % slots;
-        _llmCycleIndex = current == suggestions.Count ? -1 : current;
-        int keep = _llmCycleIndex;
-        string keepBase = _llmBase;
-        SetInputText(_llmCycleIndex == -1 ? _llmBase : suggestions[_llmCycleIndex]);
-        _llmCycleIndex = keep;
-        _llmBase = keepBase;
-        UpdateLlmUi();
-    }
-
-    private (List<LlmMessage> Messages, string Display) BuildLlmContext(TabVm vm, string typed, bool multi)
+    private (List<LlmMessage> Messages, string Display) BuildLlmContext(TabVm vm, string typed, int count)
     {
         var pairs = new List<(string Cmd, string Output)>();
         lock (vm.Screen.Sync)
@@ -1114,8 +1685,8 @@ public partial class MainWindow : Window
         }
         var messages = new List<LlmMessage>
         {
-            new("system", multi
-                ? "You predict the next shell command a user will run in cmd.exe on Windows. Respond with exactly 3 alternative complete command lines, one per line, most likely first. No commentary, no markdown, no numbering."
+            new("system", count > 1
+                ? $"You predict the next shell command a user will run in cmd.exe on Windows. Respond with exactly {count} alternative complete command lines, one per line, most likely first. No commentary, no markdown, no numbering."
                 : "You predict the next shell command a user will run in cmd.exe on Windows. Respond with exactly one complete command line. No commentary, no markdown."),
         };
         foreach (var (cmd, output) in kept)
@@ -1131,36 +1702,7 @@ public partial class MainWindow : Window
         return (messages, display);
     }
 
-    // Tab cycles through completion candidates: history commands matching the whole input first, then entries of the current directory whose name starts with the last space-separated token. One extra step wraps back to the original text.
-    private void CycleTabCompletion()
-    {
-        if (_tabCandidates == null)
-        {
-            _tabBase = InputBox.Text;
-            _tabCandidates = BuildTabCandidates(_tabBase);
-            _tabPos = -1;
-            if (_tabCandidates.Count == 0)
-            {
-                _tabCandidates = null;
-                return;
-            }
-        }
-        _tabPos = (_tabPos + 1) % (_tabCandidates.Count + 1);
-        var candidates = _tabCandidates;
-        SetInputTextPreservingTabCycle(_tabPos == candidates.Count ? _tabBase : candidates[_tabPos]);
-    }
-
-    private void SetInputTextPreservingTabCycle(string text)
-    {
-        var candidates = _tabCandidates;
-        int pos = _tabPos;
-        string baseText = _tabBase;
-        SetInputText(text);
-        _tabCandidates = candidates;
-        _tabPos = pos;
-        _tabBase = baseText;
-    }
-
+    // Regular (non-LLM) candidates: history commands matching the whole input first, then yarn scripts when applicable, then entries of the current directory whose name starts with the last space-separated token.
     private List<string> BuildTabCandidates(string text)
     {
         var result = new List<string>();
@@ -1186,7 +1728,8 @@ public partial class MainWindow : Window
         {
             AddYarnCandidates(head, token, cwd, result, seen);
         }
-        if (cwd.Length > 0)
+        // Filesystem entries only once something is typed — an empty input suggests pure command history — and they always rank below history and yarn candidates.
+        if (cwd.Length > 0 && text.Length > 0)
         {
             try
             {
@@ -1227,7 +1770,7 @@ public partial class MainWindow : Window
         }
     }
 
-    // Cached briefly because this runs on every keystroke for the ghost text.
+    // Cached briefly because this runs on every keystroke while recomputing candidates.
     private List<string> GetYarnNames(string cwd)
     {
         if (cwd == _yarnNamesCwd && Environment.TickCount64 - _yarnNamesTick < YarnNamesCacheMs)
@@ -1276,60 +1819,40 @@ public partial class MainWindow : Window
         return names;
     }
 
-    private void CycleHistory(bool older)
-    {
-        _tabCandidates = null;
-        if (_cycleMatches == null)
-        {
-            _cyclePrefix = InputBox.Text;
-            _cycleMatches = _history.Match(_cyclePrefix);
-            _cyclePos = -1;
-        }
-        if (_cycleMatches.Count == 0)
-        {
-            return;
-        }
-        if (older)
-        {
-            _cyclePos = Math.Min(_cyclePos + 1, _cycleMatches.Count - 1);
-        }
-        else
-        {
-            _cyclePos--;
-        }
-        if (_cyclePos < 0)
-        {
-            _cyclePos = -1;
-            SetInputText(_cyclePrefix);
-            return;
-        }
-        SetInputText(_cycleMatches[_cyclePos]);
-    }
-
     // --- raw keystroke mode ---
 
     private void Term_KeyDown(object sender, KeyEventArgs e)
     {
-        if (!RawMode || Active is not { Dead: false, Session: { } session })
+        if (!RawMode || Active is not { Dead: false, Session: { } session } vm)
         {
             return;
         }
-        var encoded = InputEncoder.Encode(e.Key, Keyboard.Modifiers);
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        var encoded = vm.Win32Input ? InputEncoder.EncodeWin32Key(key, Keyboard.Modifiers) : InputEncoder.Encode(key, Keyboard.Modifiers);
         if (encoded != null)
         {
             e.Handled = true;
             session.SendInput(encoded);
+            LogRawKeystroke(System.Text.Encoding.UTF8.GetString(encoded));
             Term.ScrollToBottom();
         }
     }
 
     private void Term_TextInput(object sender, TextCompositionEventArgs e)
     {
-        if (!RawMode || Active is not { Dead: false, Session: { } session } || e.Text.Length == 0)
+        if (!RawMode || Active is not { Dead: false, Session: { } session } vm || e.Text.Length == 0)
         {
             return;
         }
-        session.SendText(e.Text);
+        if (vm.Win32Input)
+        {
+            session.SendInput(InputEncoder.EncodeWin32Text(e.Text));
+        }
+        else
+        {
+            session.SendText(e.Text);
+        }
+        LogRawKeystroke(e.Text);
         Term.ScrollToBottom();
         e.Handled = true;
     }
@@ -1429,7 +1952,7 @@ public partial class MainWindow : Window
 
     private void NewTabBtn_Click(object sender, RoutedEventArgs e)
     {
-        CreateTab(NewTabInfo(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), activate: true);
+        CreateTab(NewTabInfo(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)), activate: true, insertAfterActive: true);
     }
 
     private void SettingsBtn_Click(object sender, RoutedEventArgs e)
@@ -1437,11 +1960,54 @@ public partial class MainWindow : Window
         OpenSettings();
     }
 
+    // Rebuild-and-reload: kicks off the repo's reload script, which builds, copies the output to a fresh instance folder, and starts a --takeover process for this window id. This window stays alive until the new build succeeds and kills it — a failed build costs nothing (check app.log for [reload] entries).
+    private void ReloadBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (BuildInfo.RepoRoot.Length == 0 || !Directory.Exists(BuildInfo.RepoRoot))
+        {
+            AppLog.Write("ui", "reload: repo root unavailable: " + BuildInfo.RepoRoot);
+            return;
+        }
+        SaveState();
+        ReloadBtn.Content = "⏳";
+        ReloadBtn.IsEnabled = false;
+        var psi = new ProcessStartInfo("cmd.exe")
+        {
+            WorkingDirectory = BuildInfo.RepoRoot,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.ArgumentList.Add("/c");
+        psi.ArgumentList.Add("yarn");
+        psi.ArgumentList.Add("reload-window");
+        psi.ArgumentList.Add(_windowId);
+        try
+        {
+            Process.Start(psi);
+            // Still being alive after this long means the build failed (success kills this process) — restore the button so reload can be retried.
+            Task.Delay(TimeSpan.FromSeconds(90)).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
+            {
+                ReloadBtn.Content = "⟳";
+                ReloadBtn.IsEnabled = true;
+            }));
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("ui", "reload spawn failed: " + ex);
+            ReloadBtn.Content = "⟳";
+            ReloadBtn.IsEnabled = true;
+        }
+    }
+
     private SettingsWindow OpenSettings()
     {
         if (_settingsWindow == null)
         {
-            _settingsWindow = new SettingsWindow(_settings, ApplySettings, id => _tabs.Any(t => t.Info.Id == id), AddShellTab, _predictor) { Owner = this };
+            _settingsWindow = new SettingsWindow(_settings, ApplySettings, id => _tabs.Any(t => t.Info.Id == id), id => AddShellTab(id), _predictor);
+            if (IsLoaded)
+            {
+                _settingsWindow.Owner = this;
+            }
             _settingsWindow.Closed += (_, _) => _settingsWindow = null;
             _settingsWindow.Show();
         }
@@ -1452,13 +2018,14 @@ public partial class MainWindow : Window
         return _settingsWindow;
     }
 
+    // The escape-rendering setting is per tab (right-click a tab to toggle); the global setting is only the default for newly created tabs.
     private void ApplySettings()
     {
-        foreach (var tab in _tabs)
-        {
-            tab.Parser.ShowEscapes = _settings.ShowEscapeSequences;
-        }
+        ApplyLlmUi();
     }
+
+    private const int WM_COPYDATA = 0x004A;
+    private const uint GA_ROOT = 2;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT
@@ -1467,6 +2034,26 @@ public partial class MainWindow : Window
         public int Y;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct COPYDATASTRUCT
+    {
+        public IntPtr dwData;
+        public int cbData;
+        public IntPtr lpData;
+    }
+
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, ref COPYDATASTRUCT lParam);
 }

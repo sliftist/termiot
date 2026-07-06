@@ -35,6 +35,8 @@ public partial class SettingsWindow : Window
         WriteLogImmediatelyBox.IsChecked = settings.WriteLogImmediately;
         ConfigPathBox.Text = settings.OpenRouterConfigPath;
         ContextTokensBox.Text = settings.LlmContextTokens.ToString();
+        MultiCountBox.Text = settings.MultiCompleteCount.ToString();
+        BuildTimeText.Text = BuildInfo.Display;
         _modelBox = new AutoCompleteBox { Text = settings.LlmModel };
         _modelBox.Committed += model =>
         {
@@ -42,6 +44,8 @@ public partial class SettingsWindow : Window
             _settings.Save();
         };
         ModelBoxHost.Content = _modelBox;
+        FocusSelectAll.Attach(ConfigPathBox);
+        FocusSelectAll.Attach(ContextTokensBox);
         _loaded = true;
         // Stock WPF never defocuses a TextBox when blank space is clicked (panels aren't focusable), so do it by hand: any unhandled click lands here and clears keyboard focus.
         MouseDown += (_, _) => Keyboard.ClearFocus();
@@ -53,7 +57,9 @@ public partial class SettingsWindow : Window
         {
             RefreshShellList();
             RefreshLlmInfo();
+            RefreshDefaultTerminal();
         };
+        RefreshDefaultTerminal();
         _refreshTimer.Start();
         Closed += (_, _) =>
         {
@@ -83,6 +89,20 @@ public partial class SettingsWindow : Window
         _settings.Save();
     }
 
+    private void MultiCountBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+        if (int.TryParse(MultiCountBox.Text.Trim(), out int count) && count >= 1 && count <= 100)
+        {
+            _settings.MultiCompleteCount = count;
+            _settings.Save();
+            _onChanged();
+        }
+    }
+
     private void WriteLogImmediatelyBox_Changed(object sender, RoutedEventArgs e)
     {
         if (!_loaded)
@@ -91,6 +111,45 @@ public partial class SettingsWindow : Window
         }
         _settings.WriteLogImmediately = WriteLogImmediatelyBox.IsChecked.GetValueOrDefault();
         _settings.Save();
+    }
+
+    private void RefreshDefaultTerminal()
+    {
+        var state = DefaultTerminal.GetState();
+        var text = state.Description;
+        if (state.ServerPath.Length > 0)
+        {
+            text += "\n" + state.ServerPath;
+        }
+        DefaultTerminalStatus.Text = text;
+        MakeDefaultBtn.IsEnabled = !state.IsThisExe;
+        MakeDefaultBtn.Content = state.IsThisExe ? "✓ Termiot is the default terminal" : "Make Termiot the default terminal";
+    }
+
+    private void MakeDefaultBtn_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            DefaultTerminal.MakeDefault();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("defterm", "make default failed: " + ex);
+        }
+        RefreshDefaultTerminal();
+    }
+
+    private void ResetDefaultBtn_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            DefaultTerminal.ResetDefault();
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("defterm", "reset default failed: " + ex);
+        }
+        RefreshDefaultTerminal();
     }
 
     public void SelectLlmTab()

@@ -11,6 +11,13 @@
 
   <ItemGroup>
     <None Update="restart.bat" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="start-instance.bat" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Baked into the assembly (rather than reading the exe's mtime) so the time survives the output being copied into timestamped instance folders. RepoRoot lets a copied instance find the repo to trigger rebuilds. -->
+  <ItemGroup>
+    <AssemblyMetadata Include="BuildTimeUtc" Value="$([System.DateTime]::UtcNow.ToString('o'))" />
+    <AssemblyMetadata Include="RepoRoot" Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..'))" />
   </ItemGroup>
 
 </Project>

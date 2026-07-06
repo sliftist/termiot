@@ -6,6 +6,8 @@
         "build": "node scripts/dotnet.js build Termiot",
         "build-claude": "node scripts/dotnet.js build Termiot/Termiot.csproj -o Termiot/bin/claude-check",
         "restart": "node scripts/restart.js",
+        "start-instance": "node scripts/start-instance.js",
+        "reload-window": "node scripts/reload-window.js",
         "kill": "taskkill /IM Termiot.exe /F",
         "status-claude": "node scripts/status.js",
         "test-ui-crash-claude": "node scripts/test-ui-crash.js",

@@ -4,7 +4,7 @@ Sequences the parser currently recognizes but deliberately ignores (or doesn't r
 
 ## Seen from ConPTY on every session (highest priority)
 
-- `ESC[?9001h` / `l` — **win32-input-mode**. ConPTY asks the terminal to send keyboard input as encoded Win32 INPUT_RECORDs (`ESC[<Vk>;<Sc>;<Uc>;<Kd>;<Cs>;<Rc>_`) instead of classic VT bytes. Supporting it means acknowledging the mode and switching `InputEncoder` to the win32 encoding — gains key-up events, exact virtual-key codes, and full modifier state, which VT input fundamentally can't express (e.g. Ctrl+Shift+letter distinctions, F13+, keypad vs top-row digits).
+- ~~`ESC[?9001h` / `l` — **win32-input-mode**~~ — SUPPORTED in raw-keys mode: special/modified keys and typed characters are sent as full Win32 key records (`ESC[<Vk>;<Sc>;<Uc>;<Kd>;<Cs>;<Rc>_`), preserving modifier state VT can't express (Ctrl+Enter vs Shift+Enter vs Enter). Down/up records are emitted as immediate pairs; real key-held timing isn't forwarded yet.
 - `ESC[?1004h` / `l` — **focus reporting**. When enabled, send `ESC[I` on window focus gained and `ESC[O` on focus lost. Trivial to implement: track the mode bit, hook `Window.Activated`/`Deactivated`, write the two sequences to the pty.
 
 ## Input-related modes
@@ -18,7 +18,7 @@ Sequences the parser currently recognizes but deliberately ignores (or doesn't r
 
 - `ESC[ q` (DECSCUSR) — cursor shape/blink (block, underline, bar). We always draw a block.
 - `ESC[?12h` / `l` — cursor blinking. We don't blink.
-- SGR 2 (dim), 3 (italic), 5 (blink), 8 (conceal), 9 (strikethrough), 21 (double underline), 53 (overline), 58/59 (underline color). We render bold, underline, reverse, and full color only.
+- SGR 3 (italic), 5 (blink), 8 (conceal), 9 (strikethrough), 21 (double underline), 53 (overline), 58/59 (underline color). We render bold, dim, underline, reverse, and full color.
 - `ESC(0` — DEC Special Graphics charset (line-drawing characters via `ESC(0` + `j`–`x`). We consume the designation but never translate; legacy apps drawing boxes will show letters instead of lines.
 - Wide characters (CJK, emoji): everything renders one cell wide; double-width glyphs will overlap.
 - `ESC[3J` handled (clears scrollback), but `ESC[?5h` (reverse video screen mode) and `DECSCNM` are ignored.

@@ -15,6 +15,7 @@ public sealed class AppSettings
     public int LlmContextTokens { get; set; } = 10000;
     public bool LlmEnabled { get; set; }
     public bool LlmMultiComplete { get; set; }
+    public int MultiCompleteCount { get; set; } = 3;
     public double LlmTotalCostUsd { get; set; }
     public long LlmInputTokens { get; set; }
     public long LlmOutputTokens { get; set; }

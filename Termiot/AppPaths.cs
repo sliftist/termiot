@@ -11,6 +11,7 @@ public static class AppPaths
     public static readonly string SettingsFile = Path.Combine(Root, "settings.json");
     public static readonly string HistoryFile = Path.Combine(Root, "history.txt");
     public static readonly string AppLogFile = Path.Combine(Root, "app.log");
+    public static readonly string UnhandledEscapesFile = Path.Combine(Root, "unhandled-escapes.md");
 
     static AppPaths()
     {

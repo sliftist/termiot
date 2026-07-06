@@ -60,6 +60,7 @@ public sealed class AutoCompleteBox : Grid
         Children.Add(_input);
         Children.Add(_popup);
 
+        FocusSelectAll.Attach(_input);
         _input.TextChanged += (_, _) =>
         {
             if (!_settingText)

@@ -9,9 +9,20 @@
   <DockPanel>
     <Border DockPanel.Dock="Top" Background="#FF222222">
       <DockPanel>
+        <Button x:Name="ReloadBtn" DockPanel.Dock="Right" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones)" />
         <Button x:Name="SettingsBtn" DockPanel.Dock="Right" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
+        <TextBlock x:Name="BuildTimeText" DockPanel.Dock="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
         <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" />
-        <StackPanel x:Name="TabStrip" Orientation="Horizontal" />
+        <Button x:Name="ScrollRightBtn" DockPanel.Dock="Right" Content="▶" Click="ScrollRightBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" />
+        <Button x:Name="ScrollLeftBtn" DockPanel.Dock="Left" Content="◀" Click="ScrollLeftBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" />
+        <ScrollViewer x:Name="TabScroller" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" PreviewMouseWheel="TabScroller_PreviewMouseWheel">
+          <Grid>
+            <StackPanel x:Name="TabStrip" Orientation="Horizontal" />
+            <Canvas IsHitTestVisible="False">
+              <Rectangle x:Name="DropIndicator" Width="3" Fill="#FF4EC94E" Visibility="Collapsed" />
+            </Canvas>
+          </Grid>
+        </ScrollViewer>
       </DockPanel>
     </Border>
     <Border x:Name="InputBar" DockPanel.Dock="Bottom" Background="#FF1D1D1D" Padding="8,4,8,6">
@@ -21,19 +32,21 @@
           <RowDefinition Height="Auto" />
           <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
-        <DockPanel Grid.Row="0" Margin="0,0,0,2">
+        <DockPanel x:Name="CwdRow" Grid.Row="0" Margin="0,0,0,2">
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
             <TextBlock x:Name="LlmCostText" Foreground="#FF999999" FontFamily="Consolas" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0" />
             <CheckBox x:Name="LlmToggle" Content="LLM autocomplete" Foreground="#FF999999" VerticalAlignment="Center" Checked="LlmToggle_Changed" Unchecked="LlmToggle_Changed" />
-            <CheckBox x:Name="MultiToggle" Content="multi-complete" Foreground="#FF999999" VerticalAlignment="Center" Margin="10,0,0,0" Visibility="Collapsed" Checked="MultiToggle_Changed" Unchecked="MultiToggle_Changed" />
+            <CheckBox x:Name="MultiToggle" Content="multi-complete" Foreground="#FF999999" VerticalAlignment="Center" Margin="10,0,0,0" Checked="MultiToggle_Changed" Unchecked="MultiToggle_Changed" />
           </StackPanel>
           <TextBlock x:Name="CwdLabel" Foreground="#FF6FA8DC" FontFamily="Consolas" FontSize="13" />
         </DockPanel>
         <DockPanel Grid.Row="1">
           <CheckBox x:Name="RawToggle" DockPanel.Dock="Right" Content="raw keys" Foreground="#FF999999" VerticalAlignment="Center" Margin="10,0,0,0" Checked="RawToggle_Changed" Unchecked="RawToggle_Changed" />
-          <Grid x:Name="EditorArea">
-            <TextBlock x:Name="GhostText" Foreground="#FF5F5F5F" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" IsHitTestVisible="False" Panel.ZIndex="1" />
-            <TextBox x:Name="InputBox" Background="Transparent" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" Padding="0" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" TextChanged="InputBox_TextChanged" PreviewKeyDown="InputBox_PreviewKeyDown" />
+          <Grid>
+            <Grid x:Name="EditorArea">
+              <TextBox x:Name="InputBox" Background="Transparent" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" Padding="0" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" TextChanged="InputBox_TextChanged" PreviewKeyDown="InputBox_PreviewKeyDown" />
+            </Grid>
+            <TextBlock x:Name="RawKeysText" Visibility="Collapsed" Foreground="#FF8A8A8A" FontFamily="Consolas" FontSize="13" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
           </Grid>
         </DockPanel>
         <StackPanel x:Name="SuggestionPanel" Grid.Row="2" Visibility="Collapsed" Margin="0,3,0,0" />

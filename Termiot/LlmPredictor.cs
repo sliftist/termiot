@@ -3,12 +3,13 @@ namespace Termiot;
 // Command prediction with exactly one outstanding OpenRouter request: new snapshots arriving while a request is in flight replace the pending one, and the worker keeps going until it has answered the latest snapshot. Cost/token/latency stats accumulate into settings.
 public sealed class LlmPredictor
 {
-    private const int SingleMaxTokens = 120;
-    private const int MultiMaxTokens = 300;
+    private const int BaseMaxTokens = 60;
+    private const int PerSuggestionMaxTokens = 80;
+    private const int MaxTokensCap = 2000;
 
     private readonly AppSettings _settings;
     private readonly object _lock = new();
-    private (List<LlmMessage> Messages, string ContextDisplay, bool Multi)? _pending;
+    private (List<LlmMessage> Messages, string ContextDisplay, int Count)? _pending;
     private bool _busy;
     private List<LlmModelInfo>? _models;
 
@@ -39,17 +40,11 @@ public sealed class LlmPredictor
         return _models;
     }
 
-    public void ClearSuggestions()
-    {
-        Suggestions = Array.Empty<string>();
-        Updated?.Invoke();
-    }
-
-    public void Request(List<LlmMessage> messages, string contextDisplay, bool multi)
+    public void Request(List<LlmMessage> messages, string contextDisplay, int count)
     {
         lock (_lock)
         {
-            _pending = (messages, contextDisplay, multi);
+            _pending = (messages, contextDisplay, count);
             if (_busy)
             {
                 return;
@@ -63,7 +58,7 @@ public sealed class LlmPredictor
     {
         while (true)
         {
-            (List<LlmMessage> Messages, string ContextDisplay, bool Multi) job;
+            (List<LlmMessage> Messages, string ContextDisplay, int Count) job;
             lock (_lock)
             {
                 if (_pending is not { } p)
@@ -83,9 +78,9 @@ public sealed class LlmPredictor
                     continue;
                 }
                 var pricing = _models?.FirstOrDefault(m => m.Id == _settings.LlmModel);
-                var completion = await OpenRouter.Complete(key, _settings.LlmModel, job.Messages, job.Multi ? MultiMaxTokens : SingleMaxTokens, pricing);
-                int want = job.Multi ? 3 : 1;
-                Suggestions = completion.Lines.Take(want).ToList();
+                int maxTokens = Math.Min(BaseMaxTokens + PerSuggestionMaxTokens * job.Count, MaxTokensCap);
+                var completion = await OpenRouter.Complete(key, _settings.LlmModel, job.Messages, maxTokens, pricing);
+                Suggestions = completion.Lines.Take(job.Count).ToList();
                 LastError = "";
                 _settings.LlmTotalCostUsd += completion.CostUsd;
                 _settings.LlmInputTokens += completion.PromptTokens;

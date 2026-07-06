@@ -10,7 +10,7 @@
     <TabItem Header="General">
       <StackPanel Margin="12">
         <CheckBox x:Name="ShowEscapesBox"
-                  Content="Render escape sequences literally (colored, with tooltips)"
+                  Content="Render escape sequences literally by default for new tabs (right-click a tab to toggle it per tab)"
                   Foreground="#FFDDDDDD"
                   Checked="ShowEscapesBox_Changed"
                   Unchecked="ShowEscapesBox_Changed" />
@@ -20,12 +20,24 @@
                   Margin="0,10,0,0"
                   Checked="AutoResumeBox_Changed"
                   Unchecked="AutoResumeBox_Changed" />
+        <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+          <TextBlock Text="Multi-complete suggestions (1-100):" Foreground="#FFDDDDDD" VerticalAlignment="Center" />
+          <TextBox x:Name="MultiCountBox" Width="60" Margin="8,0,0,0" Background="#FF1E1E1E" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderBrush="#FF555555" FontFamily="Consolas" TextChanged="MultiCountBox_TextChanged" />
+        </StackPanel>
         <CheckBox x:Name="WriteLogImmediatelyBox"
                   Content="Write shell output to disk immediately (default: batched once per second; applies to newly started shells)"
                   Foreground="#FFDDDDDD"
                   Margin="0,10,0,0"
                   Checked="WriteLogImmediatelyBox_Changed"
                   Unchecked="WriteLogImmediatelyBox_Changed" />
+        <TextBlock Text="Default terminal application:" Foreground="#FFAAAAAA" Margin="0,16,0,0" />
+        <TextBlock x:Name="DefaultTerminalStatus" Foreground="#FFCCCCCC" FontFamily="Consolas" FontSize="12" Margin="0,4,0,0" TextWrapping="Wrap" />
+        <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+          <Button x:Name="MakeDefaultBtn" Content="Make Termiot the default terminal" Padding="10,4" Click="MakeDefaultBtn_Click" />
+          <Button x:Name="ResetDefaultBtn" Content="Reset to Windows default" Padding="10,4" Margin="8,0,0,0" Click="ResetDefaultBtn_Click" />
+        </StackPanel>
+        <TextBlock Text="Per-user registration — no administrator prompt needed. New console windows will open in Termiot." Foreground="#FF777777" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap" />
+        <TextBlock x:Name="BuildTimeText" Foreground="#FF777777" FontSize="11" Margin="0,16,0,0" />
       </StackPanel>
     </TabItem>
     <TabItem Header="Shells">

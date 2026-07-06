@@ -18,6 +18,9 @@ public sealed class TerminalControl : FrameworkElement
 {
     private const int ScrollLinesPerNotch = 3;
     private const int WheelDeltaPerNotch = 120;
+    // SGR 2 (dim/faint): the foreground is pulled this far toward the background.
+    private const int DimAlpha = 130;
+    private const int CursorBlinkMs = 530;
 
     private GlyphAtlas? _atlas;
     private double _dpiScale = 1.0;
@@ -38,6 +41,9 @@ public sealed class TerminalControl : FrameworkElement
 
     public bool ShowTermCursor;
     public event Action<int, int>? CellSizeChanged;
+    private readonly System.Windows.Threading.DispatcherTimer _blinkTimer;
+    private bool _blinkOn = true;
+    private (int Line, int Col) _lastCursorPos = (-1, -1);
 
     public int Cols => _cols;
     public int RowsVisible => _rows;
@@ -47,6 +53,16 @@ public sealed class TerminalControl : FrameworkElement
         Focusable = true;
         FocusVisualStyle = null;
         RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.NearestNeighbor);
+        _blinkTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(CursorBlinkMs) };
+        _blinkTimer.Tick += (_, _) =>
+        {
+            _blinkOn = !_blinkOn;
+            if (ShowTermCursor)
+            {
+                RenderFrame();
+            }
+        };
+        _blinkTimer.Start();
     }
 
     public void Attach(TermScreen screen)
@@ -170,12 +186,24 @@ public sealed class TerminalControl : FrameworkElement
                 int cellCount = Math.Min(_cols, line.Cells.Length);
                 for (int c = 0; c < cellCount; c++)
                 {
-                    bool cursorHere = ShowTermCursor && _scrollOffset == 0 && _screen.CursorVisible && abs == cursorAbs && c == _screen.CursorX;
-                    DrawCell(r, c, line.Cells[c], spans, cursorHere, IsSelected(abs, c));
+                    DrawCell(r, c, line.Cells[c], spans, IsSelected(abs, c));
                 }
-                if (ShowTermCursor && _scrollOffset == 0 && _screen.CursorVisible && abs == cursorAbs && _screen.CursorX >= cellCount)
+            }
+            if (ShowTermCursor && _scrollOffset == 0 && _screen.CursorVisible)
+            {
+                // A moving cursor resets the blink phase to visible so it never disappears mid-typing.
+                var cursorPos = (cursorAbs, _screen.CursorX);
+                if (cursorPos != _lastCursorPos)
                 {
-                    DrawCell(r, _screen.CursorX, new Cell { Ch = ' ', Fg = Palette.DefaultFg, Bg = Palette.DefaultBg }, null, true, false);
+                    _lastCursorPos = cursorPos;
+                    _blinkOn = true;
+                    _blinkTimer.Stop();
+                    _blinkTimer.Start();
+                }
+                int cursorRow = cursorAbs - firstAbs;
+                if (_blinkOn && cursorRow >= 0 && cursorRow < _rows)
+                {
+                    DrawCursorBar(cursorRow, _screen.CursorX);
                 }
             }
         }
@@ -183,7 +211,23 @@ public sealed class TerminalControl : FrameworkElement
         InvalidateVisual();
     }
 
-    private void DrawCell(int row, int col, Cell cell, List<SearchSpan>? spans, bool cursor, bool selected)
+    private void DrawCursorBar(int row, int col)
+    {
+        var atlas = _atlas!;
+        int barWidth = Math.Max(2, atlas.CellWidth / 6);
+        int x0 = Math.Min(col * atlas.CellWidth, Math.Max(0, _pxWidth - barWidth));
+        int y0 = row * atlas.CellHeight;
+        for (int y = 0; y < atlas.CellHeight && y0 + y < _pxHeight; y++)
+        {
+            int rowBase = (y0 + y) * _pxWidth + x0;
+            for (int x = 0; x < barWidth; x++)
+            {
+                _pix[rowBase + x] = unchecked((int)Palette.DefaultFg);
+            }
+        }
+    }
+
+    private void DrawCell(int row, int col, Cell cell, List<SearchSpan>? spans, bool selected)
     {
         var atlas = _atlas!;
         int cw = atlas.CellWidth;
@@ -205,6 +249,10 @@ public sealed class TerminalControl : FrameworkElement
         {
             fg = Palette.Brighten(fg);
         }
+        if ((cell.Flags & CellFlags.Dim) != 0)
+        {
+            fg = (uint)Blend(fg, bg, DimAlpha);
+        }
         if ((cell.Flags & CellFlags.Reverse) != 0)
         {
             (fg, bg) = (bg, fg);
@@ -223,10 +271,6 @@ public sealed class TerminalControl : FrameworkElement
         if (selected)
         {
             bg = Palette.SelectionBg;
-        }
-        if (cursor)
-        {
-            (fg, bg) = (bg, fg);
         }
 
         for (int y = 0; y < ch; y++)

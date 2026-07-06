@@ -8,6 +8,7 @@ public enum CellFlags : byte
     Underline = 2,
     Reverse = 4,
     Escape = 8,
+    Dim = 16,
 }
 
 public struct Cell
