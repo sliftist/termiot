@@ -78,6 +78,10 @@ public partial class MainWindow : Window
     private int _candIndex = -1;
     private int _candWindowStart;
     private string _candBase = "";
+    // History walking (Up from the "center"): entries swap into the input without appearing in the suggestion rows; Down walks back toward the stashed typed text. -1 = not in history.
+    private int _histIndex = -1;
+    private List<string> _histEntries = new();
+    private string _histStash = "";
 
     private const int RawKeyLogMaxChars = 400;
     private string _rawKeyLog = "";
@@ -1580,6 +1584,7 @@ public partial class MainWindow : Window
         {
             return;
         }
+        _histIndex = -1;
         if (Active is { } vm)
         {
             vm.PendingInput = InputBox.Text;
@@ -1652,6 +1657,8 @@ public partial class MainWindow : Window
         InputBox.Text = text;
         InputBox.CaretIndex = text.Length;
         _settingInputText = false;
+        // Any programmatic text change ends a history walk; the Up/Down handlers re-assign the index right after when the change IS the walk.
+        _histIndex = -1;
         if (Active is { } vm)
         {
             vm.PendingInput = text;
@@ -1699,11 +1706,49 @@ public partial class MainWindow : Window
                 CycleCandidates((Keyboard.Modifiers & ModifierKeys.Shift) != 0);
                 break;
             }
+            // The input is the "center": Down goes into the autocomplete rows below, Up goes into history above (swapped straight into the input, never shown as rows). Any edit resets to center.
             case Key.Up:
+            {
+                e.Handled = true;
+                if (_histIndex >= 0)
+                {
+                    if (_histIndex + 1 < _histEntries.Count)
+                    {
+                        int next = _histIndex + 1;
+                        SetInputText(_histEntries[next]);
+                        _histIndex = next;
+                    }
+                }
+                else if (_candIndex >= 0)
+                {
+                    CycleCandidates(backwards: true);
+                }
+                else
+                {
+                    _histEntries = _history.Match("");
+                    if (_histEntries.Count > 0)
+                    {
+                        var stash = InputBox.Text;
+                        SetInputText(_histEntries[0]);
+                        _histStash = stash;
+                        _histIndex = 0;
+                    }
+                }
+                break;
+            }
             case Key.Down:
             {
                 e.Handled = true;
-                CycleCandidates(e.Key == Key.Up);
+                if (_histIndex >= 0)
+                {
+                    int next = _histIndex - 1;
+                    SetInputText(next >= 0 ? _histEntries[next] : _histStash);
+                    _histIndex = next;
+                }
+                else
+                {
+                    CycleCandidates(backwards: false);
+                }
                 break;
             }
         }
