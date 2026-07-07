@@ -34,17 +34,29 @@ public static class StartupTrace
 
     public static void Flush()
     {
+        AppLog.Write("startup", Format(" | "));
+    }
+
+    // The timeline as text; each entry is "name +delta (@absolute)" in ms since process start. Used by both the log flush (single line) and the settings Startup tab (one per line).
+    public static string Format(string separator)
+    {
         var sb = new StringBuilder();
         sb.Append($"process-start→main {_runtimeInitMs:0}ms");
         lock (Marks)
         {
+            // Sort by timestamp: marks arrive from both the UI thread and the background restore thread, so insertion order isn't time order and unsorted deltas would go negative.
+            var ordered = Marks.OrderBy(m => m.Ms).ToList();
             double previous = _runtimeInitMs;
-            foreach (var (name, ms) in Marks.Skip(1))
+            foreach (var (name, ms) in ordered)
             {
-                sb.Append($" | {name} +{ms - previous:0} (@{ms:0})");
+                if (name == "main-entry")
+                {
+                    continue;
+                }
+                sb.Append($"{separator}{name} +{ms - previous:0} (@{ms:0})");
                 previous = ms;
             }
         }
-        AppLog.Write("startup", sb.ToString());
+        return sb.ToString();
     }
 }

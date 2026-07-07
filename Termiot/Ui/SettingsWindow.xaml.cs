@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
@@ -21,6 +22,9 @@ public partial class SettingsWindow : Window
     private Window? _contextWindow;
     private bool _loaded;
     private bool _modelsRequested;
+    private string _buildLogShown = "";
+    // Frozen shell display order, computed once on first view so the list doesn't reshuffle live as shells' last-activity times change.
+    private List<string>? _shellOrder;
 
     public SettingsWindow(AppSettings settings, Action onChanged, Func<string, bool> isOpenInWindow, Action<string> resurrect, LlmPredictor predictor)
     {
@@ -35,6 +39,8 @@ public partial class SettingsWindow : Window
         WriteLogImmediatelyBox.IsChecked = settings.WriteLogImmediately;
         ReopenOnStartupBox.IsChecked = settings.ReopenOnStartup;
         ShowTabResourcesBox.IsChecked = settings.ShowTabResources;
+        SingleRowTabsBox.IsChecked = settings.SingleRowTabs;
+        SwapEnterBox.IsChecked = settings.SwapEnterSubmit;
         ShowFpsBox.IsChecked = settings.ShowFps;
         ConfigPathBox.Text = settings.OpenRouterConfigPath;
         ContextTokensBox.Text = settings.LlmContextTokens.ToString();
@@ -71,13 +77,21 @@ public partial class SettingsWindow : Window
             RefreshStartMenu();
             RefreshContextMenu();
             RefreshClaudeHook();
+            RefreshBuildLog();
+            RefreshStartupTrace();
+            RefreshProfiling();
         };
+        RefreshBuildLog();
+        RefreshStartupTrace();
+        RefreshProfiling();
         RefreshWindowList();
         RefreshDefaultTerminal();
         RefreshCursorExec();
         RefreshStartMenu();
         RefreshContextMenu();
         RefreshClaudeHook();
+        BuildHotkeysPanel();
+        PreviewKeyDown += HotkeyCapture_PreviewKeyDown;
         _refreshTimer.Start();
         Closed += (_, _) =>
         {
@@ -122,6 +136,110 @@ public partial class SettingsWindow : Window
             _settings.Save();
             _onChanged();
         }
+    }
+
+    // Hotkey rebinding: click a gesture button, press the new combo (Esc cancels); ⟲ restores the default. Only overrides are persisted.
+    private HotkeyDef? _capturingHotkey;
+    private Button? _capturingButton;
+
+    private void BuildHotkeysPanel()
+    {
+        HotkeysPanel.Children.Clear();
+        HotkeysPanel.Children.Add(new TextBlock
+        {
+            Text = "Click a shortcut, then press the new key combination. Esc cancels; ⟲ restores the default.",
+            Foreground = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88)),
+            Margin = new Thickness(0, 0, 0, 10),
+        });
+        foreach (var def in Hotkeys.All)
+        {
+            var row = new DockPanel { Margin = new Thickness(0, 3, 0, 3) };
+            var gesture = Hotkeys.GestureFor(_settings, def.Id);
+            bool overridden = gesture != def.DefaultGesture;
+            var reset = new Button
+            {
+                Content = "⟲",
+                Width = 26,
+                Margin = new Thickness(6, 0, 0, 0),
+                IsEnabled = overridden,
+                ToolTip = "Reset to " + def.DefaultGesture,
+            };
+            var button = new Button
+            {
+                Content = gesture,
+                MinWidth = 140,
+                Padding = new Thickness(8, 2, 8, 2),
+                FontFamily = new FontFamily("Consolas"),
+                Tag = def,
+            };
+            button.Click += (_, _) =>
+            {
+                CancelHotkeyCapture();
+                _capturingHotkey = def;
+                _capturingButton = button;
+                button.Content = "press keys…";
+            };
+            reset.Click += (_, _) =>
+            {
+                _settings.Hotkeys.Remove(def.Id);
+                _settings.Save();
+                BuildHotkeysPanel();
+            };
+            DockPanel.SetDock(button, Dock.Right);
+            DockPanel.SetDock(reset, Dock.Right);
+            row.Children.Add(reset);
+            row.Children.Add(button);
+            row.Children.Add(new TextBlock
+            {
+                Text = def.Label,
+                Foreground = new SolidColorBrush(Color.FromRgb(0xDD, 0xDD, 0xDD)),
+                VerticalAlignment = VerticalAlignment.Center,
+            });
+            HotkeysPanel.Children.Add(row);
+        }
+    }
+
+    private void CancelHotkeyCapture()
+    {
+        if (_capturingHotkey != null && _capturingButton != null)
+        {
+            _capturingButton.Content = Hotkeys.GestureFor(_settings, _capturingHotkey.Id);
+        }
+        _capturingHotkey = null;
+        _capturingButton = null;
+    }
+
+    private void HotkeyCapture_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_capturingHotkey == null)
+        {
+            return;
+        }
+        e.Handled = true;
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (Hotkeys.IsModifierKey(key))
+        {
+            return;
+        }
+        if (key == Key.Escape)
+        {
+            CancelHotkeyCapture();
+            return;
+        }
+        var def = _capturingHotkey;
+        var gesture = Hotkeys.Format(key, Keyboard.Modifiers);
+        if (gesture == def.DefaultGesture)
+        {
+            _settings.Hotkeys.Remove(def.Id);
+        }
+        else
+        {
+            _settings.Hotkeys[def.Id] = gesture;
+        }
+        _settings.Save();
+        _capturingHotkey = null;
+        _capturingButton = null;
+        BuildHotkeysPanel();
     }
 
     private void LlmTriggerBox_Changed(object sender, RoutedEventArgs e)
@@ -180,6 +298,27 @@ public partial class SettingsWindow : Window
         _onChanged();
     }
 
+    private void SwapEnterBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+        _settings.SwapEnterSubmit = SwapEnterBox.IsChecked.GetValueOrDefault();
+        _settings.Save();
+    }
+
+    private void SingleRowTabsBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+        _settings.SingleRowTabs = SingleRowTabsBox.IsChecked.GetValueOrDefault();
+        _settings.Save();
+        _onChanged();
+    }
+
     private void ShowFpsBox_Changed(object sender, RoutedEventArgs e)
     {
         if (!_loaded)
@@ -219,6 +358,84 @@ public partial class SettingsWindow : Window
         }
     }
 
+    // Opens a folder in Explorer; when selectPath points at a file, opens its containing folder with that file highlighted so the user can open it with whatever they like.
+    private static void OpenInExplorer(string folder, string? selectPath = null)
+    {
+        try
+        {
+            if (selectPath != null)
+            {
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{selectPath}\"") { UseShellExecute = true });
+            }
+            else
+            {
+                Process.Start(new ProcessStartInfo(folder) { UseShellExecute = true });
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("settings", "open in explorer failed: " + ex.Message);
+        }
+    }
+
+    private static Button FolderButton(string content, string tooltip, Action onClick)
+    {
+        var btn = new Button
+        {
+            Content = content,
+            Width = 62,
+            Margin = new Thickness(6, 0, 0, 0),
+            ToolTip = tooltip,
+        };
+        btn.Click += (_, _) => onClick();
+        return btn;
+    }
+
+    private void RefreshStartupTrace()
+    {
+        var text = Termiot.StartupTrace.Format(Environment.NewLine);
+        if (StartupTraceBox.Text != text)
+        {
+            StartupTraceBox.Text = text;
+        }
+    }
+
+    private void RefreshProfiling()
+    {
+        var text = Termiot.PerfLog.Format(Environment.NewLine);
+        if (ProfilingBox.Text != text)
+        {
+            ProfilingBox.Text = text;
+        }
+    }
+
+    private void RefreshBuildLog()
+    {
+        string text;
+        try
+        {
+            // Shared read: a build triggered from another window's process may be appending to this file right now.
+            using var fs = new FileStream(AppPaths.BuildLogFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            text = sr.ReadToEnd();
+        }
+        catch (FileNotFoundException)
+        {
+            text = "";
+        }
+        catch (Exception ex)
+        {
+            text = "(build log unavailable: " + ex.Message + ")";
+        }
+        if (text == _buildLogShown)
+        {
+            return;
+        }
+        _buildLogShown = text;
+        BuildLogBox.Text = text.Length > 0 ? text : "No rebuild has run yet. Click the ⟳ button in a window's title bar to rebuild; its output appears here.";
+        BuildLogBox.ScrollToEnd();
+    }
+
     // All windows known on disk, most recent first — running or not — resurrectable like shells, but at the window level.
     private void RefreshWindowList()
     {
@@ -245,6 +462,8 @@ public partial class SettingsWindow : Window
         foreach (var entry in entries)
         {
             bool running = entry.State.OwnerPid != 0 && HostInfo.ProcessAlive(entry.State.OwnerPid, entry.State.OwnerStartTicks);
+            // LoadTabs applies the same died-near-close filter the reopen path uses, so the list shows exactly what "Reopen" will restore.
+            var tabs = entry.State.LoadTabs();
             var headerPanel = new StackPanel { Orientation = Orientation.Horizontal };
             headerPanel.Children.Add(new TextBlock
             {
@@ -255,7 +474,7 @@ public partial class SettingsWindow : Window
             });
             headerPanel.Children.Add(new TextBlock
             {
-                Text = $"{entry.State.Shells.Count} tab{(entry.State.Shells.Count == 1 ? "" : "s")}",
+                Text = $"{tabs.Count} tab{(tabs.Count == 1 ? "" : "s")}",
                 Foreground = new SolidColorBrush(Color.FromRgb(0xDD, 0xDD, 0xDD)),
                 Width = 60,
                 VerticalAlignment = VerticalAlignment.Center,
@@ -274,19 +493,36 @@ public partial class SettingsWindow : Window
                 RefreshWindowList();
             };
             headerPanel.Children.Add(button);
+            headerPanel.Children.Add(new TextBlock
+            {
+                Text = windowId + ".json",
+                Foreground = new SolidColorBrush(Color.FromRgb(0x99, 0x99, 0x99)),
+                FontFamily = new FontFamily("Consolas"),
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(10, 0, 0, 0),
+            });
+            var windowFile = AppPaths.WindowFile(windowId);
+            headerPanel.Children.Add(FolderButton("Folder", $"Open {AppPaths.WindowsDir} with {windowId}.json selected", () => OpenInExplorer(AppPaths.WindowsDir, windowFile)));
 
             var tabList = new StackPanel { Margin = new Thickness(24, 2, 0, 4) };
-            foreach (var shellId in entry.State.Shells)
+            foreach (var info in tabs)
             {
-                var info = ShellInfo.Load(shellId) ?? new ShellInfo();
-                tabList.Children.Add(new TextBlock
+                var tabRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 1, 0, 1) };
+                tabRow.Children.Add(new TextBlock
                 {
                     Text = (info.ForcedTitle.Length > 0 ? info.ForcedTitle : info.Title) + "  " + info.Cwd,
                     Foreground = new SolidColorBrush(Color.FromRgb(0x99, 0x99, 0x99)),
                     FontFamily = new FontFamily("Consolas"),
                     FontSize = 12,
+                    Width = 360,
                     TextTrimming = TextTrimming.CharacterEllipsis,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    ToolTip = $"{info.Cwd}\nid: {info.Id}",
                 });
+                var tabShellDir = AppPaths.ShellDir(info.Id);
+                tabRow.Children.Add(FolderButton("Folder", $"Open {tabShellDir}", () => OpenInExplorer(tabShellDir)));
+                tabList.Children.Add(tabRow);
             }
             var expander = new Expander
             {
@@ -614,16 +850,33 @@ public partial class SettingsWindow : Window
             AppLog.Write("settings", "shell list failed: " + ex.Message);
             return;
         }
-        // Most recently used first: output.log's write time is the shell's last activity (falls back to the folder timestamp for shells that never produced output).
-        Array.Sort(dirs, (a, b) => LastUsed(b).CompareTo(LastUsed(a)));
-        if (dirs.Length == 0)
+        var byId = new Dictionary<string, string>();
+        foreach (var d in dirs)
+        {
+            byId[Path.GetFileName(d)] = d;
+        }
+        if (_shellOrder == null)
+        {
+            // First view: most recently used first (output.log's write time is the shell's last activity, falling back to the folder timestamp), then frozen so it doesn't reshuffle live.
+            Array.Sort(dirs, (a, b) => LastUsed(b).CompareTo(LastUsed(a)));
+            _shellOrder = dirs.Select(d => Path.GetFileName(d)!).ToList();
+        }
+        else
+        {
+            _shellOrder.RemoveAll(id => !byId.ContainsKey(id));
+            // Shells created since the list froze go to the top without disturbing the order of the rest.
+            var fresh = byId.Keys.Where(id => !_shellOrder.Contains(id)).ToList();
+            fresh.Sort((a, b) => LastUsed(byId[b]).CompareTo(LastUsed(byId[a])));
+            _shellOrder.InsertRange(0, fresh);
+        }
+        if (_shellOrder.Count == 0)
         {
             ShellsPanel.Children.Add(new TextBlock { Text = "No shells have been run yet.", Foreground = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88)) });
             return;
         }
-        foreach (var dir in dirs)
+        foreach (var id in _shellOrder)
         {
-            var id = Path.GetFileName(dir);
+            var dir = byId[id];
             var info = ShellInfo.Load(id) ?? new ShellInfo();
             bool alive = HostInfo.IsShellAlive(id);
             bool open = _isOpenInWindow(id);
@@ -637,7 +890,8 @@ public partial class SettingsWindow : Window
             };
             var title = new TextBlock
             {
-                Text = string.IsNullOrEmpty(info.Title) ? id : info.Title,
+                // Prefer the user's renamed title (ForcedTitle) over the automatic one, same as the Windows tab.
+                Text = info.ForcedTitle.Length > 0 ? info.ForcedTitle : (string.IsNullOrEmpty(info.Title) ? id : info.Title),
                 Foreground = new SolidColorBrush(Color.FromRgb(0xDD, 0xDD, 0xDD)),
                 Width = 140,
                 TextTrimming = TextTrimming.CharacterEllipsis,
@@ -666,11 +920,13 @@ public partial class SettingsWindow : Window
                 _resurrect(shellId);
                 RefreshShellList();
             };
+            var shellDir = dir;
             var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 3, 0, 3) };
             row.Children.Add(status);
             row.Children.Add(title);
             row.Children.Add(cwd);
             row.Children.Add(button);
+            row.Children.Add(FolderButton("Folder", $"Open {shellDir}", () => OpenInExplorer(shellDir)));
             ShellsPanel.Children.Add(row);
         }
     }

@@ -13,6 +13,10 @@ public sealed class AppSettings
     public int ScrollbackLines { get; set; } = Terminal.TermScreen.DefaultScrollbackCap;
     public bool ShowTabResources { get; set; }
     public bool ShowFps { get; set; }
+    public bool SingleRowTabs { get; set; }
+    public bool SwapEnterSubmit { get; set; }
+    // Hotkey overrides only (id → gesture); defaults live in Hotkeys.All.
+    public Dictionary<string, string> Hotkeys { get; set; } = new();
 
     public string OpenRouterConfigPath { get; set; } = "";
     public string LlmModel { get; set; } = "qwen/qwen3-coder-30b-a3b-instruct";

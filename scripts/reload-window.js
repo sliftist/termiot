@@ -22,8 +22,9 @@ function run(exe, args) {
     return new Promise((resolve) => {
         const child = spawn(exe, args, { stdio: ["ignore", "pipe", "pipe"] });
         let output = "";
-        child.stdout.on("data", (chunk) => (output += chunk));
-        child.stderr.on("data", (chunk) => (output += chunk));
+        // Forward every chunk to our own stdout as it arrives, so the renderer (which captures this process's output into build.log) sees the full build progress live — essential for diagnosing a build that hangs rather than fails.
+        child.stdout.on("data", (chunk) => { output += chunk; process.stdout.write(chunk); });
+        child.stderr.on("data", (chunk) => { output += chunk; process.stdout.write(chunk); });
         child.on("error", (err) => resolve({ code: 1, output: String(err.stack ?? err) }));
         child.on("close", (code) => resolve({ code: code ?? 1, output }));
     });

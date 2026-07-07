@@ -57,6 +57,20 @@
                   Unchecked="ShowFpsBox_Changed">
           <TextBlock Text="Show render FPS in the title bar (painted frames · per-frame cost · sustainable ceiling)" />
         </CheckBox>
+        <CheckBox x:Name="SwapEnterBox"
+                  Foreground="#FFDDDDDD"
+                  Margin="0,10,0,0"
+                  Checked="SwapEnterBox_Changed"
+                  Unchecked="SwapEnterBox_Changed">
+          <TextBlock Text="Enter and Ctrl+Enter are swapped: Enter adds a newline to the input; Ctrl+Enter or Shift+Enter submits" />
+        </CheckBox>
+        <CheckBox x:Name="SingleRowTabsBox"
+                  Foreground="#FFDDDDDD"
+                  Margin="0,10,0,0"
+                  Checked="SingleRowTabsBox_Changed"
+                  Unchecked="SingleRowTabsBox_Changed">
+          <TextBlock Text="Single-row tabs: keep all tabs on one line and scroll horizontally (default: wrap onto as many rows as needed)" />
+        </CheckBox>
         <CheckBox x:Name="ReopenOnStartupBox"
                   Foreground="#FFDDDDDD"
                   Margin="0,10,0,0"
@@ -91,6 +105,11 @@
         <TextBlock Text="Start menu:" Foreground="#FFAAAAAA" Margin="0,16,0,0" />
         <TextBlock x:Name="StartMenuStatus" Foreground="#FFCCCCCC" FontFamily="Consolas" FontSize="12" Margin="0,4,0,0" />
         <Button x:Name="StartMenuBtn" Content="Add this executable to the Start menu" Padding="10,4" Margin="0,6,0,0" HorizontalAlignment="Left" Click="StartMenuBtn_Click" />
+        <TextBlock Text="Rebuild log (most recent ⟳ reload):" Foreground="#FFAAAAAA" Margin="0,16,0,0" />
+        <TextBox x:Name="BuildLogBox" IsReadOnly="True" Height="180" Margin="0,4,0,0"
+                 Background="#FF1E1E1E" Foreground="#FFCCCCCC" BorderBrush="#FF555555"
+                 FontFamily="Consolas" FontSize="12" TextWrapping="NoWrap"
+                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" />
         <TextBlock x:Name="BuildTimeText" Foreground="#FF777777" FontSize="11" Margin="0,16,0,0" />
       </StackPanel>
       </ScrollViewer>
@@ -100,10 +119,33 @@
         <StackPanel x:Name="ShellsPanel" Margin="12" />
       </ScrollViewer>
     </TabItem>
+    <TabItem Header="Hotkeys">
+      <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel x:Name="HotkeysPanel" Margin="12" />
+      </ScrollViewer>
+    </TabItem>
     <TabItem Header="Windows">
       <ScrollViewer VerticalScrollBarVisibility="Auto">
         <StackPanel x:Name="WindowsPanel" Margin="12" />
       </ScrollViewer>
+    </TabItem>
+    <TabItem Header="Startup">
+      <DockPanel Margin="12">
+        <TextBlock DockPanel.Dock="Top" Text="Renderer startup timeline for this window (ms since process start). Each line is a milestone with the delta since the previous one — the big deltas are where reload time goes." Foreground="#FFAAAAAA" Margin="0,0,0,6" />
+        <TextBox x:Name="StartupTraceBox" IsReadOnly="True" Margin="0,0,0,0"
+                 Background="#FF1E1E1E" Foreground="#FFCCCCCC" BorderBrush="#FF555555"
+                 FontFamily="Consolas" FontSize="12" TextWrapping="NoWrap"
+                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" />
+      </DockPanel>
+    </TabItem>
+    <TabItem Header="Profiling">
+      <DockPanel Margin="12">
+        <TextBlock DockPanel.Dock="Top" Text="Per-tab restore timings (most recent first). head-transfer = time to stream the history over the pipe before parsing; head = the parse breakdown (feed = escape parsing, snapshot/prepend = building scrollback)." Foreground="#FFAAAAAA" Margin="0,0,0,6" />
+        <TextBox x:Name="ProfilingBox" IsReadOnly="True"
+                 Background="#FF1E1E1E" Foreground="#FFCCCCCC" BorderBrush="#FF555555"
+                 FontFamily="Consolas" FontSize="12" TextWrapping="NoWrap"
+                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" />
+      </DockPanel>
     </TabItem>
     <TabItem x:Name="LlmTab" Header="LLM">
       <StackPanel Margin="12">

@@ -41,6 +41,21 @@ public sealed class TermScreen
     public int ScrollbackCount => _scrollback.Count;
     public int TotalLines => _scrollback.Count + _rows;
 
+    // Approximate character count of the whole buffer: sum of each line's cell array length (scrollback lines are trimmed of trailing blanks, so this tracks real content). O(lines), cheap; caller must hold Sync.
+    public long TotalChars()
+    {
+        long total = 0;
+        foreach (var line in _scrollback)
+        {
+            total += line.Cells.Length;
+        }
+        foreach (var line in _lines)
+        {
+            total += line.Cells.Length;
+        }
+        return total;
+    }
+
     public TermScreen(int cols, int rows)
     {
         _cols = Math.Max(2, cols);
@@ -217,6 +232,41 @@ public sealed class TermScreen
         {
             _scrollback.RemoveRange(0, _scrollback.Count - ScrollbackCap);
         }
+    }
+
+    // Insert already-rendered lines at the very top of scrollback (older than everything currently held). Staged restore shows the recent tail first, then parses the older history on a background thread and prepends the result here. Lines go in as-is: scrollback rows are variable-width by design (trailing blanks trimmed), so widening them here would be both wrong and — since it reallocates every row under Sync — a paint-blocking stall.
+    public void PrependScrollback(IReadOnlyList<TermLine> older)
+    {
+        if (older.Count == 0)
+        {
+            return;
+        }
+        _scrollback.InsertRange(0, older);
+        if (_scrollback.Count > ScrollbackCap + ScrollbackTrimChunk)
+        {
+            _scrollback.RemoveRange(0, _scrollback.Count - ScrollbackCap);
+        }
+    }
+
+    // A frozen top-to-bottom snapshot of every line this screen holds (scrollback, then the live rows down to the last non-empty one) — used to lift a scratch screen's parsed history into another screen's scrollback.
+    public List<TermLine> SnapshotLines()
+    {
+        var result = new List<TermLine>(_scrollback);
+        int lastNonBlank = -1;
+        for (int i = 0; i < _rows; i++)
+        {
+            if (_lines[i].GetText().Length > 0)
+            {
+                lastNonBlank = i;
+            }
+        }
+        for (int i = 0; i <= lastNonBlank; i++)
+        {
+            // Match scrollback convention (trimmed, variable-width) so prepend never has to touch these rows.
+            _lines[i].TrimTrailingBlanks();
+            result.Add(_lines[i]);
+        }
+        return result;
     }
 
     public void SetCursorPos(int row, int col)

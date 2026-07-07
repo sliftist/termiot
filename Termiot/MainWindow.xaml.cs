@@ -36,8 +36,15 @@ public partial class MainWindow : Window
         // Null while the tab is a not-yet-resumed restore: the tab and its saved state exist, but no shell process runs until the user confirms (or auto-resume is on).
         public ShellSession? Session;
         public bool Dead;
+        // True from the moment a session starts until its replay burst settles: the terminal is held behind a loading overlay so the recent history isn't animated frame-by-frame, then revealed in one paint. Purely client-side — doesn't depend on the host build. Volatile because the render tick reads it while output arrives on the reader thread.
+        public volatile bool Replaying;
+        // Environment.TickCount64 when the session started and when its last output byte arrived; the render tick reveals once output has been quiet for a moment (the replay finished) or a hard cap elapses.
+        public long ReplayStartTicks;
+        public long LastOutputTicks;
         public int Dirty;
         public bool Win32Input;
+        // Runtime: the connected host reported it's running elevated (drives the admin badge). Distinct from Info.Elevated, which is the sticky preference.
+        public bool Elevated;
         public bool LoggedFirstRender;
         public string PendingInput = "";
         public string LastCommand = "";
@@ -47,13 +54,21 @@ public partial class MainWindow : Window
         public List<(string Cmd, int Line)> CommandMarks = new();
         // Set when the shell process names itself via OSC title sequences; empty = use our automatic "folder + command" title.
         public string CustomTitle = "";
+        // Latest raw OSC title (written on the reader thread) and a flag the render tick consumes — coalesced so a replay with thousands of title changes triggers one header relayout per frame, not thousands of dispatches.
+        public volatile string? PendingTitle;
+        public int TitleDirty;
+        // Cached AUTORESUME.cmd contents ("" = none), refreshed off the UI thread so the hot title-refresh path never touches disk. Null = not yet loaded.
+        public string? AutoResumeContent;
         public Border Header = null!;
         public TextBlock HeaderText = null!;
         public TextBox TitleEditor = null!;
         public TextBlock AutoResumeButton = null!;
+        public TextBlock RestartButton = null!;
         public TextBlock RevertTitleButton = null!;
         public TextBlock Win32Badge = null!;
+        public TextBlock AdminBadge = null!;
         public StackPanel ResourceRow = null!;
+        public double StickyHeaderWidth;
         // Index order: VRAM, CPU, memory.
         public TextBlock[] ResourceTexts = null!;
         public System.Windows.Shapes.Rectangle[] ResourceBars = null!;
@@ -93,6 +108,24 @@ public partial class MainWindow : Window
     private const int WindowFileSyncMs = 15000;
     // Gives the dying host time to release its pipe name and exit before the replacement spawns.
     private const int ShellRestartDelayMs = 500;
+    // Upper bound on waiting for a killed host to actually vanish before spawning its replacement (returns as soon as it's gone, usually tens of ms).
+    private const int HostDeathWaitMs = 2000;
+    // Keep the restart progress icon this long after the new shell is up, so a fast restart is still noticeable.
+    private const int RestartIconLingerMs = 2000;
+    // Gap between starting each non-focused tab's session during restore, so several heavy shells never replay/parse their history simultaneously.
+    private const int RestoreStaggerMs = 120;
+    // Non-focused tabs' history reconstruction is held until this long after the focused tab's is done (or until the tab is switched to), so it can't slow the initial load.
+    private const int BackgroundHeadDelayMs = 5000;
+    // Don't flash the loading overlay for replays that finish quickly; only show it if the replay is still running after this long.
+    private const int LoadingOverlayDelayMs = 200;
+    // The replay burst is a back-to-back stream of frames; once no output has arrived for this long, it's finished and we reveal the caught-up screen.
+    private const int RevealIdleMs = 60;
+    // Hard cap so a tab can never stay stuck behind the overlay (e.g. a shell spewing continuously right at reconnect never goes idle).
+    private const int ReplayRevealTimeoutMs = 5000;
+    // Hard ceiling on the rebuild: a build that wedges (rather than failing) gets killed so the reload button can never hang on the hourglass forever.
+    private const int ReloadTimeoutMinutes = 3;
+    // How many trailing build-log lines the reload button's tooltip shows (the full log lives in the settings window).
+    private const int BuildLogTooltipTailLines = 40;
 
     private const int LlmDebounceMs = 400;
     private const int LlmMaxPairs = 20;
@@ -100,6 +133,16 @@ public partial class MainWindow : Window
     private const int LlmMaxOutputLines = 40;
     private bool _settingInputText;
     private bool _closedBecauseEmpty;
+    // Set once the window starts closing so the async restore (and its staggered follow-ups) stop creating tabs on a window that's going away.
+    private bool _closing;
+    // Startup profiling: mark the first replay byte and the first painted frame exactly once each.
+    private int _tracedFirstOutput;
+    private bool _tracedFirstRender;
+    // The tab focused at restore, and whether its completion has kicked off the delayed background-history reconstruction.
+    private TabVm? _restoreFocusedTab;
+    private bool _backgroundHeadsScheduled;
+    // Count of title-change dispatches queued to the UI thread — a flood here would be its own source of stall.
+    private int _titleDispatches;
     private TextBox? _activeTitleEditor;
     // Checkbox Checked/Unchecked handlers fire from the ctor's programmatic IsChecked assignments; side effects (saving, opening windows) must wait for real user interaction.
     private readonly bool _uiReady;
@@ -116,6 +159,8 @@ public partial class MainWindow : Window
         var launchForeground = GetForegroundWindow();
         InitializeComponent();
         StartupTrace.Mark("init-component");
+        _inlinePlus = new Button { Content = "+", Width = 30, Background = Brushes.Transparent, Foreground = new SolidColorBrush(Color.FromRgb(0xAA, 0xAA, 0xAA)), BorderThickness = new Thickness(0), FontSize = 16 };
+        _inlinePlus.Click += NewTabBtn_Click;
         _settings = AppSettings.Load();
         StartupTrace.Mark("settings+history");
         // Explicit launches (e.g. Cursor's Ctrl+Shift+C) take focus — the user asked for a terminal. Everything else (restores, respawns) surfaces via the topmost flip without stealing focus.
@@ -160,7 +205,7 @@ public partial class MainWindow : Window
         _renderTimer.Start();
         // The window file is the single source of truth for window↔shell ownership; re-reading it periodically picks up shells assigned to this window by other processes even if their handoff message was lost.
         _syncTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(WindowFileSyncMs) };
-        _syncTimer.Tick += (_, _) => SyncTabsFromWindowFile();
+        _syncTimer.Tick += (_, _) => SyncTabsFromWindowFileAsync();
         _syncTimer.Start();
 
         _predictor = new LlmPredictor(_settings);
@@ -168,7 +213,11 @@ public partial class MainWindow : Window
         {
             if (UseLlmFor(InputBox.Text))
             {
-                _candidates = _predictor.Suggestions.ToList();
+                // Models love echoing the typed text back and repeating themselves; neither is a useful suggestion.
+                _candidates = _predictor.Suggestions
+                    .Where(s => s.Trim().Length > 0 && !string.Equals(s.Trim(), InputBox.Text.Trim(), StringComparison.OrdinalIgnoreCase))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
                 _candIndex = -1;
                 _candWindowStart = 0;
             }
@@ -193,6 +242,7 @@ public partial class MainWindow : Window
                 FpsText.Text = count > 0 ? $"{count} fps · {avgMs:0.0}ms ≈{Math.Min(9999, 1000 / Math.Max(0.01, avgMs)):0} cap" : "0 fps";
             }
             UpdateResourceRows();
+            UpdateScrollStats();
         };
         statsTimer.Start();
         LlmToggle.IsChecked = _settings.LlmEnabled;
@@ -217,12 +267,27 @@ public partial class MainWindow : Window
             Dispatcher.BeginInvoke(DispatcherPriority.Input, FocusInput);
         };
         FocusSelectAll.Attach(SearchBox);
+        // Only width changes rewrap the text and change the line count; reacting to our own height set (WidthChanged false) would just re-enter.
+        InputBox.SizeChanged += (_, e) =>
+        {
+            if (e.WidthChanged)
+            {
+                AdjustInputHeight();
+            }
+        };
+        Scrollbar.Attach(Term);
         Term.CellSizeChanged += OnCellSizeChanged;
         Term.KeyDown += Term_KeyDown;
         Term.TextInput += Term_TextInput;
         PreviewKeyDown += Window_PreviewKeyDown;
         LocationChanged += (_, _) => ScheduleSave();
-        SizeChanged += (_, _) => ScheduleSave();
+        SizeChanged += (_, _) =>
+        {
+            ScheduleSave();
+            RelayoutTabRows();
+        };
+        // The scroller's slot shrinks/grows as the top-bar controls (fps, build text, window name) change size; row 0's capacity follows it.
+        TabScroller.SizeChanged += (_, _) => RelayoutTabRows();
         // Tab adoption between our windows and open-tab-here requests arrive as WM_COPYDATA — a private channel, no OLE drag-drop involved.
         SourceInitialized += (_, _) =>
         {
@@ -232,13 +297,14 @@ public partial class MainWindow : Window
         };
         Closing += (_, _) =>
         {
+            _closing = true;
             if (_closedBecauseEmpty)
             {
                 Termiot.WindowState.Delete(_windowId);
             }
             else
             {
-                SaveState(closedCleanly: !Program.SessionEnding);
+                SaveState(closedCleanly: !Program.SessionEnding, closing: true);
             }
             _settingsWindow?.Close();
             LastActiveWindow.Remove(_windowId);
@@ -259,26 +325,7 @@ public partial class MainWindow : Window
             CreateTab(NewTabInfo(dir), activate: true, insertAfterActive: true);
             ForceForeground();
         }));
-        foreach (var info in state.LoadTabs())
-        {
-            bool alive = HostInfo.IsShellAlive(info.Id);
-            // A shell that never ran (no host.json) is a fresh seed, not a terminated session — start it outright instead of asking to resume.
-            bool everRan = File.Exists(AppPaths.HostInfoFile(info.Id));
-            var vm = CreateTab(info, activate: false, start: alive || !everRan);
-            if (!alive && everRan && (_settings.AutoResumeShells || forceResume))
-            {
-                ResumeTab(vm, runAutoResumeCommand: true);
-            }
-            else if (!alive && !everRan)
-            {
-                // Fresh seeds with a pre-written AUTORESUME.cmd (--ensure launches) run their command immediately.
-                RunAutoResumeCommand(vm);
-            }
-        }
-        if (_tabs.Count > 0)
-        {
-            ActivateTab(Math.Clamp(state.ActiveIndex, 0, _tabs.Count - 1));
-        }
+        BeginRestore(state, forceResume);
         StartupTrace.Mark("tabs-created");
         Loaded += (_, _) =>
         {
@@ -290,6 +337,139 @@ public partial class MainWindow : Window
             StartupTrace.Mark("content-rendered");
             StartupTrace.Flush();
         };
+    }
+
+    private sealed class RestoreEntry
+    {
+        public TabInfo Info = null!;
+        public bool Alive;
+        public bool EverRan;
+    }
+
+    // Restore is fully off the UI thread up to the point of touching controls: all per-shell disk reads (shell.json, host.json liveness, the died-near-close filter) happen in the background, then tabs are created and their sessions started focused-first and staggered — so the tab the user sees loads and renders before the others begin, and no heavy shell's replay/parse piles onto another's.
+    private void BeginRestore(Termiot.WindowState state, bool forceResume)
+    {
+        string focusedId = state.Shells.Count > 0 ? state.Shells[Math.Clamp(state.ActiveIndex, 0, state.Shells.Count - 1)] : "";
+        long exitCutoff = state.ClosedAtTicks > 0 ? state.ClosedAtTicks - TimeSpan.FromSeconds(Termiot.WindowState.ExitNearCloseGraceSeconds).Ticks : 0;
+        StartupTrace.Mark($"restore-kickoff({state.Shells.Count})");
+        Task.Run(() =>
+        {
+            // Gap from restore-kickoff shows thread-pool spin-up; the gap to restore-entries-ready is the disk-read + liveness cost.
+            StartupTrace.Mark("restore-bg-entered");
+            var entries = new List<RestoreEntry>();
+            foreach (var id in state.Shells)
+            {
+                if (!Directory.Exists(AppPaths.ShellDir(id)))
+                {
+                    continue;
+                }
+                var info = ShellInfo.Load(id) ?? new ShellInfo();
+                // One liveness check per shell, reused for both the died-near-close filter and the entry (Process.GetProcessById + StartTime is not free).
+                bool alive = HostInfo.IsShellAlive(id);
+                if (exitCutoff > 0 && info.ExitedAtTicks != 0 && info.ExitedAtTicks < exitCutoff && !alive)
+                {
+                    continue;
+                }
+                entries.Add(new RestoreEntry
+                {
+                    Info = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks },
+                    Alive = alive,
+                    // A shell that never ran (no host.json) is a fresh seed, not a terminated session — start it outright instead of asking to resume.
+                    EverRan = File.Exists(AppPaths.HostInfoFile(id)),
+                });
+            }
+            StartupTrace.Mark($"restore-entries-ready({entries.Count})");
+            Dispatcher.BeginInvoke(() => ApplyRestore(entries, focusedId, forceResume));
+        });
+    }
+
+    private void ApplyRestore(List<RestoreEntry> entries, string focusedId, bool forceResume)
+    {
+        if (_closing || _closedBecauseEmpty || entries.Count == 0)
+        {
+            return;
+        }
+        // Gap from restore-entries-ready shows how long the UI thread was busy before it could run this; the next gaps are tab-header construction and starting the focused shell's session.
+        StartupTrace.Mark("restore-apply-start");
+        var vms = entries.Select(e => CreateTab(e.Info, activate: false, start: false)).ToList();
+        StartupTrace.Mark($"restore-tabs-created({vms.Count})");
+        int focusedIdx = entries.FindIndex(e => e.Info.Id == focusedId);
+        if (focusedIdx < 0)
+        {
+            focusedIdx = 0;
+        }
+        _restoreFocusedTab = vms[focusedIdx];
+        ActivateTab(focusedIdx);
+        StartRestored(vms[focusedIdx], entries[focusedIdx], forceResume);
+        if (vms[focusedIdx].Session is { } focusedSession)
+        {
+            // Focused tab: parse and reconstruct as part of the initial load. Its completion starts the delay before the rest.
+            focusedSession.Activate();
+        }
+        else
+        {
+            // No focused session to wait on (e.g. a dead shell showing the resume prompt) — schedule the rest directly.
+            ScheduleBackgroundHeads();
+        }
+        StartupTrace.Mark("restore-focused-started");
+        // Flush now so the timeline is on disk even though this is well past ContentRendered; first-output-frame and first-tab-render refine it.
+        StartupTrace.Flush();
+        var rest = Enumerable.Range(0, vms.Count).Where(i => i != focusedIdx).ToList();
+        StaggerStartRest(rest, vms, entries, forceResume, 0);
+    }
+
+    private void StaggerStartRest(List<int> order, List<TabVm> vms, List<RestoreEntry> entries, bool forceResume, int i)
+    {
+        if (_closing || i >= order.Count)
+        {
+            return;
+        }
+        int idx = order[i];
+        if (_tabs.Contains(vms[idx]))
+        {
+            StartRestored(vms[idx], entries[idx], forceResume);
+        }
+        // Spread the background head-parses so several heavy shells never fill in their history at once.
+        Task.Delay(RestoreStaggerMs).ContinueWith(_ => Dispatcher.BeginInvoke(() => StaggerStartRest(order, vms, entries, forceResume, i + 1)));
+    }
+
+    // Kick off the delay after which every not-yet-reconstructed tab gets its history rebuilt (unless the user switches to it first, which reconstructs it immediately).
+    private void ScheduleBackgroundHeads()
+    {
+        if (_backgroundHeadsScheduled)
+        {
+            return;
+        }
+        _backgroundHeadsScheduled = true;
+        Task.Delay(BackgroundHeadDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(ParseBackgroundHeads));
+    }
+
+    private void ParseBackgroundHeads()
+    {
+        foreach (var vm in _tabs)
+        {
+            if (vm != _restoreFocusedTab)
+            {
+                vm.Session?.Activate();
+            }
+        }
+    }
+
+    private void StartRestored(TabVm vm, RestoreEntry entry, bool forceResume)
+    {
+        if (entry.Alive || !entry.EverRan)
+        {
+            StartSession(vm);
+        }
+        if (!entry.Alive && entry.EverRan && (_settings.AutoResumeShells || forceResume))
+        {
+            ResumeTab(vm, runAutoResumeCommand: true);
+        }
+        else if (!entry.Alive && !entry.EverRan)
+        {
+            // Fresh seeds with a pre-written AUTORESUME.cmd (--ensure launches) run their command immediately.
+            RunAutoResumeCommand(vm);
+        }
     }
 
     private TabVm? Active => _active >= 0 && _active < _tabs.Count ? _tabs[_active] : null;
@@ -306,17 +486,13 @@ public partial class MainWindow : Window
         var screen = new TermScreen(120, 30) { ScrollbackCap = _settings.ScrollbackLines };
         var parser = new VtParser(screen) { ShowEscapes = _settings.ShowEscapeSequences };
         var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput, History = new CommandHistory(AppPaths.ShellHistoryFile(info.Id)) };
-        parser.OnTitle = title => Dispatcher.BeginInvoke(() =>
+        // Just record the latest title; the render tick applies it (see RenderDirtyTabs). Dispatching per sequence floods the UI thread — a heavy replay carries thousands of title changes.
+        parser.OnTitle = title =>
         {
-            title = title.Trim();
-            // cmd constantly re-announces its own path as the title; only deliberate titles (e.g. the `title` command) count as custom.
-            vm.CustomTitle = title.Length == 0 || title.EndsWith("cmd.exe", StringComparison.OrdinalIgnoreCase) ? "" : title;
-            RefreshTabTitle(vm);
-            if (vm == Active)
-            {
-                UpdateWindowTitle();
-            }
-        });
+            Interlocked.Increment(ref _titleDispatches);
+            vm.PendingTitle = title;
+            Interlocked.Exchange(ref vm.TitleDirty, 1);
+        };
         parser.OnCommandMarker = cmd => vm.CommandMarks.Add((cmd, vm.Screen.ScrollbackCount + vm.Screen.CursorY));
         parser.OnWin32InputMode = on =>
         {
@@ -332,6 +508,7 @@ public partial class MainWindow : Window
         };
         BuildTabHeader(vm);
         RefreshTabTitle(vm);
+        RefreshAutoResumeState(vm);
         int index = insertIndex >= 0 ? Math.Clamp(insertIndex, 0, _tabs.Count) : insertAfterActive && _active >= 0 && _active < _tabs.Count ? _active + 1 : _tabs.Count;
         _tabs.Insert(index, vm);
         if (start)
@@ -349,9 +526,52 @@ public partial class MainWindow : Window
 
     private void StartSession(TabVm vm)
     {
-        var session = ShellSession.Create(vm.Info.Id, string.IsNullOrEmpty(vm.Info.Cwd) ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : vm.Info.Cwd, _windowId, vm.Screen, vm.Parser);
+        if (vm.Info.ExitedAtTicks != 0)
+        {
+            vm.Info.ExitedAtTicks = 0;
+            ShellInfo.Save(vm.Info);
+        }
+        var session = ShellSession.Create(vm.Info.Id, string.IsNullOrEmpty(vm.Info.Cwd) ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : vm.Info.Cwd, _windowId, vm.Screen, vm.Parser, vm.Info.Elevated);
         vm.Session = session;
-        session.OutputReceived += () => Interlocked.Exchange(ref vm.Dirty, 1);
+        session.ElevatedReported += elevated => Dispatcher.BeginInvoke(() =>
+        {
+            if (vm.Session != session)
+            {
+                return;
+            }
+            vm.Elevated = elevated;
+            RefreshTabTitle(vm);
+        });
+        // Hold painting from the outset: parse the replay silently, then reveal the caught-up screen in one paint (see the reveal check in RenderDirtyTabs). Set before Begin so no frame can paint first.
+        vm.ReplayStartTicks = Environment.TickCount64;
+        vm.LastOutputTicks = 0;
+        vm.Replaying = true;
+        Task.Delay(LoadingOverlayDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(UpdateLoadingOverlay));
+        session.OutputReceived += () =>
+        {
+            vm.LastOutputTicks = Environment.TickCount64;
+            Interlocked.Exchange(ref vm.Dirty, 1);
+            if (Interlocked.Exchange(ref _tracedFirstOutput, 1) == 0)
+            {
+                StartupTrace.Mark("first-output-frame");
+            }
+        };
+        // Restored history is prepended above the tail already on screen, shifting every existing line down; command marks are absolute line indices, so move them by the same amount. Raised under Screen.Sync (which also guards CommandMarks), so this stays consistent with parsing and LLM-context reads.
+        session.ScrollbackPrepended += delta =>
+        {
+            for (int i = 0; i < vm.CommandMarks.Count; i++)
+            {
+                vm.CommandMarks[i] = (vm.CommandMarks[i].Cmd, vm.CommandMarks[i].Line + delta);
+            }
+        };
+        // Once the focused tab's older history is loaded, wait, then load the rest — so background tabs never compete with the initial load.
+        session.ScrollbackLoaded += () => Dispatcher.BeginInvoke(() =>
+        {
+            if (vm == _restoreFocusedTab)
+            {
+                ScheduleBackgroundHeads();
+            }
+        });
         session.Exited += _ => Dispatcher.BeginInvoke(() =>
         {
             // A stale Exited from a replaced session (e.g. after a shell restart) must not mark the new one dead.
@@ -360,6 +580,8 @@ public partial class MainWindow : Window
                 return;
             }
             vm.Dead = true;
+            vm.Info.ExitedAtTicks = DateTime.UtcNow.Ticks;
+            ShellInfo.Save(vm.Info);
             if (vm == Active)
             {
                 Term.ShowTermCursor = RawMode && !vm.Dead;
@@ -396,35 +618,63 @@ public partial class MainWindow : Window
     // Kill the shell process, then treat the tab exactly like a freshly restored one: with an AUTORESUME.cmd present, either auto-resume it (setting on) or show the resume confirmation; without one, just start a new shell — same directory, full history via log replay.
     private void RestartShell(TabVm vm)
     {
-        vm.Session?.ShutdownHost();
+        // Show progress the instant it's clicked.
+        SetTabRestarting(vm, true);
+        var old = vm.Session;
+        var shellId = vm.Info.Id;
+        bool wasElevated = vm.Elevated;
         vm.Session = null;
         vm.Dead = false;
         vm.Running = false;
         RefreshTabTitle(vm);
-        Task.Delay(ShellRestartDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
+        Task.Run(() =>
         {
-            if (vm.Session != null || !_tabs.Contains(vm))
+            // Kill as hard as possible and WAIT until the host process is actually gone before spawning the replacement — a lingering old host would fight the new one for the pipe name, which is what made restart flaky. Off the UI thread since the teardown can stall.
+            if (wasElevated)
             {
-                return;
+                // An unelevated renderer can't force-kill an elevated process; ask the host to terminate itself instead.
+                old?.ShutdownHost();
             }
-            bool hasAutoResume = File.Exists(AppPaths.AutoResumeFile(vm.Info.Id));
-            if (hasAutoResume && _settings.AutoResumeShells)
+            else
             {
-                ResumeTab(vm, runAutoResumeCommand: true);
-                return;
+                old?.KillHost();
+                HostInfo.Kill(shellId);
             }
-            if (!hasAutoResume)
+            var deadline = Environment.TickCount64 + HostDeathWaitMs;
+            while (HostInfo.IsShellAlive(shellId) && Environment.TickCount64 < deadline)
             {
+                Thread.Sleep(20);
+            }
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (!_tabs.Contains(vm))
+                {
+                    return;
+                }
+                // Always start a fresh shell (never fall into the resume-prompt); re-run AUTORESUME.cmd if the tab has one.
                 StartSession(vm);
+                RunAutoResumeCommand(vm);
                 RefreshTabTitle(vm);
-            }
-            if (vm == Active)
-            {
-                UpdateResumeOverlay();
-                ApplyInputMode();
-                UpdateWindowTitle();
-            }
-        }));
+                if (vm == Active)
+                {
+                    UpdateResumeOverlay();
+                    ApplyInputMode();
+                    UpdateWindowTitle();
+                }
+                // Keep the progress icon a couple seconds longer so a fast restart is still visible.
+                Task.Delay(RestartIconLingerMs).ContinueWith(_ => Dispatcher.BeginInvoke(() => SetTabRestarting(vm, false)));
+            });
+        });
+    }
+
+    private void SetTabRestarting(TabVm vm, bool restarting)
+    {
+        if (vm.RestartButton == null)
+        {
+            return;
+        }
+        vm.RestartButton.Text = restarting ? "⏳" : "↻";
+        vm.RestartButton.Foreground = new SolidColorBrush(restarting ? Color.FromRgb(0xE0, 0xC0, 0x40) : Color.FromRgb(0x88, 0x88, 0x88));
     }
 
     private void ResumeTab(TabVm vm, bool runAutoResumeCommand)
@@ -471,9 +721,9 @@ public partial class MainWindow : Window
             ActivateTab(_tabs.IndexOf(vm));
             ForceForeground();
         }
-        if (vm.Session != null)
+        if (vm.Session is { } old)
         {
-            vm.Session.ShutdownHost();
+            Task.Run(old.KillHost);
             vm.Session = null;
             vm.Dead = false;
             Task.Delay(ShellRestartDelayMs).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
@@ -512,6 +762,39 @@ public partial class MainWindow : Window
         }
     }
 
+    // Reads AUTORESUME.cmd off the UI thread and refreshes the cached value + dependent UI. External writers (the Claude hook, --ensure) are picked up on the periodic sync tick; local actions call this directly.
+    private void RefreshAutoResumeState(TabVm vm)
+    {
+        var path = AppPaths.AutoResumeFile(vm.Info.Id);
+        Task.Run(() =>
+        {
+            string content = "";
+            try
+            {
+                if (File.Exists(path))
+                {
+                    content = File.ReadAllText(path).Trim();
+                }
+            }
+            catch
+            {
+            }
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (!_tabs.Contains(vm) || vm.AutoResumeContent == content)
+                {
+                    return;
+                }
+                vm.AutoResumeContent = content;
+                RefreshTabTitle(vm);
+                if (vm == Active)
+                {
+                    UpdateResumeOverlay();
+                }
+            });
+        });
+    }
+
     private void UpdateResumeOverlay()
     {
         var vm = Active;
@@ -521,18 +804,8 @@ public partial class MainWindow : Window
         {
             return;
         }
-        string autoResumePath = AppPaths.AutoResumeFile(vm!.Info.Id);
-        string content = "";
-        try
-        {
-            if (File.Exists(autoResumePath))
-            {
-                content = File.ReadAllText(autoResumePath).Trim();
-            }
-        }
-        catch
-        {
-        }
+        // Cached (refreshed off-thread by RefreshAutoResumeState) so showing the overlay never blocks on disk.
+        string content = vm!.AutoResumeContent ?? "";
         if (content.Length > 0)
         {
             AutoResumeText.Text = "On resume, AUTORESUME.cmd will run:\n" + content;
@@ -696,6 +969,17 @@ public partial class MainWindow : Window
             EndTitleEdit(vm, commit: false);
         };
         vm.RevertTitleButton = revertTitle;
+        // Indicator only: the shell's host is running elevated (administrator).
+        var adminBadge = new TextBlock
+        {
+            Text = "🛡",
+            Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0xB0, 0x40)),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(6, 0, 0, 0),
+            Visibility = Visibility.Collapsed,
+            ToolTip = "Running as administrator",
+        };
+        vm.AdminBadge = adminBadge;
         // Indicator only: the shell has enabled win32-input-mode (an icon rather than title text — titles are too cramped for it).
         var win32Badge = new TextBlock
         {
@@ -724,8 +1008,9 @@ public partial class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(8, 0, 0, 0),
             Cursor = Cursors.Hand,
-            ToolTip = "Restart shell (Alt+Pause) — same directory, keeps history",
+            ToolTip = "Restart shell — kills it and starts a new one in the same directory (scrollback is kept)",
         };
+        vm.RestartButton = refresh;
         refresh.MouseLeftButtonDown += (_, e) =>
         {
             e.Handled = true;
@@ -748,6 +1033,7 @@ public partial class MainWindow : Window
         panel.Children.Add(text);
         panel.Children.Add(editor);
         panel.Children.Add(revertTitle);
+        panel.Children.Add(adminBadge);
         panel.Children.Add(win32Badge);
         panel.Children.Add(autoRun);
         panel.Children.Add(refresh);
@@ -759,7 +1045,7 @@ public partial class MainWindow : Window
         var border = new Border
         {
             Child = headerStack,
-            Padding = new Thickness(12, 6, 10, 6),
+            Padding = new Thickness(12, 2, 10, 2),
             Cursor = Cursors.Hand,
             Background = Brushes.Transparent,
         };
@@ -844,10 +1130,10 @@ public partial class MainWindow : Window
     private void OnTabDragMove(MouseEventArgs e)
     {
         _dragGhost?.MoveToCursor(VisualTreeHelper.GetDpi(this).DpiScaleX);
-        var pos = e.GetPosition(TabScroller);
-        if (pos.X >= 0 && pos.X <= TabScroller.ActualWidth && pos.Y >= 0 && pos.Y <= TabScroller.ActualHeight)
+        var pos = e.GetPosition(TabBar);
+        if (pos.X >= 0 && pos.X <= TabBar.ActualWidth && pos.Y >= 0 && pos.Y <= TabBar.ActualHeight)
         {
-            ShowDropIndicator(TabInsertIndexAt(e.GetPosition(TabStrip).X));
+            ShowDropIndicator(TabInsertIndexAt(pos));
         }
         else
         {
@@ -869,9 +1155,9 @@ public partial class MainWindow : Window
 
     private void EndTabDrag(TabVm vm, Border border, MouseEventArgs e)
     {
-        var stripPos = e.GetPosition(TabScroller);
-        bool overOwnStrip = stripPos.X >= 0 && stripPos.X <= TabScroller.ActualWidth && stripPos.Y >= 0 && stripPos.Y <= TabScroller.ActualHeight;
-        int stripIndex = TabInsertIndexAt(e.GetPosition(TabStrip).X);
+        var stripPos = e.GetPosition(TabBar);
+        bool overOwnStrip = stripPos.X >= 0 && stripPos.X <= TabBar.ActualWidth && stripPos.Y >= 0 && stripPos.Y <= TabBar.ActualHeight;
+        int stripIndex = TabInsertIndexAt(stripPos);
         CancelTabDrag(border);
         GetCursorPos(out var cursor);
         var rootUnderCursor = GetAncestor(WindowFromPoint(cursor), GA_ROOT);
@@ -991,10 +1277,10 @@ public partial class MainWindow : Window
         int insertIndex = -1;
         try
         {
-            var local = TabScroller.PointFromScreen(new Point(x, y));
-            if (local.X >= 0 && local.X <= TabScroller.ActualWidth && local.Y >= 0 && local.Y <= TabScroller.ActualHeight)
+            var local = TabBar.PointFromScreen(new Point(x, y));
+            if (local.X >= 0 && local.X <= TabBar.ActualWidth && local.Y >= 0 && local.Y <= TabBar.ActualHeight)
             {
-                insertIndex = TabInsertIndexAt(TabStrip.PointFromScreen(new Point(x, y)).X);
+                insertIndex = TabInsertIndexAt(local);
             }
         }
         catch
@@ -1040,44 +1326,159 @@ public partial class MainWindow : Window
         ActivateTab(Math.Clamp(index, 0, _tabs.Count - 1));
     }
 
-    // A green line drawn on an overlay canvas between the tabs — a pure preview; nothing in the strip moves until the drop.
+    // A green line drawn on an overlay canvas between the tabs — a pure preview; nothing in the strip moves until the drop. The canvas overlays the whole (possibly multi-row) tab bar, so the indicator lands at the edge of the target header wherever its row is.
     private void ShowDropIndicator(int index)
     {
-        double x = 0;
-        for (int i = 0; i < Math.Min(index, _tabs.Count); i++)
+        if (_tabs.Count == 0)
         {
-            x += _tabs[i].Header.ActualWidth;
+            DropIndicator.Visibility = Visibility.Collapsed;
+            return;
         }
-        Canvas.SetLeft(DropIndicator, Math.Max(0, x - 1.5));
-        Canvas.SetTop(DropIndicator, 0);
-        DropIndicator.Height = Math.Max(10, TabStrip.ActualHeight);
-        DropIndicator.Visibility = Visibility.Visible;
+        var header = _tabs[Math.Min(index, _tabs.Count - 1)].Header;
+        try
+        {
+            var topLeft = header.TranslatePoint(new Point(0, 0), TabBar);
+            double x = index < _tabs.Count ? topLeft.X : topLeft.X + header.ActualWidth;
+            Canvas.SetLeft(DropIndicator, Math.Max(0, x - 1.5));
+            Canvas.SetTop(DropIndicator, topLeft.Y);
+            DropIndicator.Height = Math.Max(10, header.ActualHeight);
+            DropIndicator.Visibility = Visibility.Visible;
+        }
+        catch
+        {
+            DropIndicator.Visibility = Visibility.Collapsed;
+        }
     }
 
-    private int TabInsertIndexAt(double x)
+    // Insert position from a point in TabBar coordinates: the row is chosen by Y, the slot within it by X against each header's center. A point past a row's last header inserts after it; a point below every row appends.
+    private int TabInsertIndexAt(Point point)
     {
-        double acc = 0;
+        int afterRowLast = -1;
         for (int i = 0; i < _tabs.Count; i++)
         {
-            double width = _tabs[i].Header.ActualWidth;
-            if (x < acc + width / 2)
+            var header = _tabs[i].Header;
+            if (header.Parent == null)
+            {
+                continue;
+            }
+            Point topLeft;
+            try
+            {
+                topLeft = header.TranslatePoint(new Point(0, 0), TabBar);
+            }
+            catch
+            {
+                continue;
+            }
+            if (point.Y < topLeft.Y || point.Y > topLeft.Y + header.ActualHeight)
+            {
+                continue;
+            }
+            if (point.X < topLeft.X + header.ActualWidth / 2)
             {
                 return i;
             }
-            acc += width;
+            afterRowLast = i + 1;
         }
-        return _tabs.Count;
+        return afterRowLast >= 0 ? afterRowLast : _tabs.Count;
     }
 
     private void RefreshTabHeaders()
     {
-        TabStrip.Children.Clear();
         for (int i = 0; i < _tabs.Count; i++)
         {
             var vm = _tabs[i];
             // Dark theme: the selected tab goes DARKER (pure black, merging with the terminal below), not lighter; inactive tabs alternate two shades so their boundaries are visible.
             vm.Header.Background = vm == Active ? Brushes.Black : (i % 2 == 0 ? Brushes.Transparent : new SolidColorBrush(Color.FromRgb(0x2C, 0x2C, 0x2C)));
-            TabStrip.Children.Add(vm.Header);
+        }
+        RelayoutTabRows();
+    }
+
+    // Multi-row tab strip. Row 0 shares the top bar with the window controls; further full-width rows are created on demand — as many as the tabs need, nothing scrolls.
+    private const double StickyHeaderShrinkPx = 30;
+    // Long enough for a paste-detection window to close, short enough to feel instant.
+    private const int Win32EnterDelayMs = 50;
+    private readonly List<StackPanel> _extraRowPanels = new();
+    private Button _inlinePlus = null!;
+
+    private void RelayoutTabRows()
+    {
+        TabStrip.Children.Clear();
+        foreach (var panel in _extraRowPanels)
+        {
+            panel.Children.Clear();
+        }
+        if (_inlinePlus.Parent is Panel plusParent)
+        {
+            plusParent.Children.Remove(_inlinePlus);
+        }
+        // The scroller stretches to fill the top bar's remaining slot, so its own width IS row 0's capacity — no estimating around the other controls.
+        double capacity0 = TabScroller.ActualWidth > 0 ? TabScroller.ActualWidth - 2 : 0;
+        // Single-row mode: everything lives in the top scroller and overflow scrolls, exactly the pre-wrap behavior.
+        if (!_settings.SingleRowTabs)
+        {
+            TabScroller.ScrollToHorizontalOffset(0);
+        }
+        if (_settings.SingleRowTabs)
+        {
+            foreach (var vm in _tabs)
+            {
+                vm.Header.MinWidth = 0;
+                TabStrip.Children.Add(vm.Header);
+            }
+            TabStrip.Children.Add(_inlinePlus);
+            while (_extraRowPanels.Count > 0)
+            {
+                TabBarRows.Children.Remove(_extraRowPanels[^1]);
+                _extraRowPanels.RemoveAt(_extraRowPanels.Count - 1);
+            }
+            return;
+        }
+        double capacityFull = Math.Max(100, TabBarRows.ActualWidth);
+        Panel PanelFor(int r)
+        {
+            while (_extraRowPanels.Count < r)
+            {
+                var panel = new StackPanel { Orientation = Orientation.Horizontal };
+                _extraRowPanels.Add(panel);
+                TabBarRows.Children.Add(panel);
+            }
+            return r == 0 ? TabStrip : _extraRowPanels[r - 1];
+        }
+        double CapacityFor(int r) => r == 0 ? capacity0 : capacityFull;
+        int row = 0;
+        double used = 0;
+        foreach (var vm in _tabs)
+        {
+            var header = vm.Header;
+            header.MinWidth = 0;
+            header.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+            double natural = header.DesiredSize.Width;
+            // Width stickiness: titles change constantly (command names come and go), so a header that shrinks a little keeps its previous width as padding instead of reflowing the rows. Growth, or a shrink beyond the threshold, re-anchors.
+            if (natural >= vm.StickyHeaderWidth || vm.StickyHeaderWidth - natural > StickyHeaderShrinkPx)
+            {
+                vm.StickyHeaderWidth = natural;
+            }
+            double width = vm.StickyHeaderWidth;
+            header.MinWidth = width;
+            if (used + width > CapacityFor(row) && PanelFor(row).Children.Count > 0)
+            {
+                row++;
+                used = 0;
+            }
+            PanelFor(row).Children.Add(header);
+            used += width;
+        }
+        // The + trails the last tab, spilling to the next row only if it genuinely doesn't fit.
+        if (used + _inlinePlus.Width > CapacityFor(row) && PanelFor(row).Children.Count > 0)
+        {
+            row++;
+        }
+        PanelFor(row).Children.Add(_inlinePlus);
+        while (_extraRowPanels.Count > row)
+        {
+            TabBarRows.Children.Remove(_extraRowPanels[^1]);
+            _extraRowPanels.RemoveAt(_extraRowPanels.Count - 1);
         }
     }
 
@@ -1109,13 +1510,17 @@ public partial class MainWindow : Window
         var vm = _tabs[index];
         Term.ShowTermCursor = RawMode && !vm.Dead && vm.Session != null;
         Term.Attach(vm.Screen);
+        // Switching to a tab loads its older history now rather than waiting for the delayed pass (its recent tail is already on screen from the file read).
+        vm.Session?.Activate();
         CwdLabel.Text = vm.Info.Cwd;
         SetInputText(vm.PendingInput);
         // The tab strip scrolls; an activated tab must be visible.
         Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () => vm.HeaderText.BringIntoView());
         RefreshCandidates();
         UpdateResumeOverlay();
+        UpdateLoadingOverlay();
         UpdateWindowTitle();
+        UpdateScrollStats();
         RefreshTabHeaders();
         if (SearchBar.Visibility == Visibility.Visible)
         {
@@ -1133,7 +1538,10 @@ public partial class MainWindow : Window
         {
             return;
         }
-        vm.Session?.ShutdownHost();
+        if (vm.Session is { } old)
+        {
+            Task.Run(old.KillHost);
+        }
         _tabs.RemoveAt(index);
         SaveState();
         if (_tabs.Count == 0)
@@ -1145,18 +1553,71 @@ public partial class MainWindow : Window
         ActivateTab(Math.Clamp(index, 0, _tabs.Count - 1));
     }
 
+    private void RevealReplay(TabVm vm)
+    {
+        if (!vm.Replaying)
+        {
+            return;
+        }
+        vm.Replaying = false;
+        if (vm == Active)
+        {
+            Term.RenderFrame();
+        }
+        UpdateLoadingOverlay();
+    }
+
+    private void UpdateLoadingOverlay()
+    {
+        LoadingOverlay.Visibility = Active is { Replaying: true } ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void ApplyPendingTitle(TabVm vm)
+    {
+        var title = (vm.PendingTitle ?? "").Trim();
+        // cmd constantly re-announces its own path as the title; only deliberate titles (e.g. the `title` command) count as custom.
+        vm.CustomTitle = title.Length == 0 || title.EndsWith("cmd.exe", StringComparison.OrdinalIgnoreCase) ? "" : title;
+        RefreshTabTitle(vm);
+        if (vm == Active)
+        {
+            UpdateWindowTitle();
+        }
+    }
+
     private void RenderDirtyTabs()
     {
         foreach (var vm in _tabs)
         {
+            // Reveal a replaying tab once its burst of replay output has gone quiet (finished catching up), or a hard cap elapses.
+            if (vm.Replaying)
+            {
+                long now = Environment.TickCount64;
+                long sinceOutput = vm.LastOutputTicks != 0 ? now - vm.LastOutputTicks : now - vm.ReplayStartTicks;
+                if (sinceOutput > RevealIdleMs || now - vm.ReplayStartTicks > ReplayRevealTimeoutMs)
+                {
+                    RevealReplay(vm);
+                }
+            }
+            // Apply the latest title once per tick regardless of output, coalescing any burst of title changes into a single header relayout.
+            if (Interlocked.Exchange(ref vm.TitleDirty, 0) == 1)
+            {
+                ApplyPendingTitle(vm);
+            }
             if (Interlocked.Exchange(ref vm.Dirty, 0) == 0)
             {
                 continue;
             }
             UpdateCwd(vm);
-            if (vm == Active)
+            if (vm == Active && !vm.Replaying)
             {
                 Term.RenderFrame();
+            }
+            if (!_tracedFirstRender)
+            {
+                _tracedFirstRender = true;
+                // The moment content is actually on screen; gap from first-output-frame is parse + render. titles= flags a title-dispatch flood if that's the stall instead.
+                StartupTrace.Mark($"first-tab-render(titles={_titleDispatches})");
+                StartupTrace.Flush();
             }
             if (!vm.LoggedFirstRender)
             {
@@ -1244,9 +1705,25 @@ public partial class MainWindow : Window
         };
         var rename = new MenuItem { Header = "Rename tab…" };
         rename.Click += (_, _) => StartTitleEdit(vm);
+        var admin = new MenuItem
+        {
+            Header = "Run as administrator",
+            IsCheckable = true,
+            IsChecked = vm.Info.Elevated,
+        };
+        admin.Click += (_, _) => SetElevated(vm, admin.IsChecked);
         menu.Items.Add(escapes);
         menu.Items.Add(rename);
+        menu.Items.Add(admin);
         menu.IsOpen = true;
+    }
+
+    // Toggle the sticky elevated preference and restart the shell so the new host is (or isn't) elevated. Elevating prompts UAC; the renderer stays unelevated.
+    private void SetElevated(TabVm vm, bool elevated)
+    {
+        vm.Info.Elevated = elevated;
+        ShellInfo.Save(vm.Info);
+        RestartShell(vm);
     }
 
     private void StartTitleEdit(TabVm vm)
@@ -1288,6 +1765,7 @@ public partial class MainWindow : Window
     private void RefreshTabTitle(TabVm vm)
     {
         vm.Win32Badge.Visibility = vm.Win32Input ? Visibility.Visible : Visibility.Collapsed;
+        vm.AdminBadge.Visibility = vm.Elevated ? Visibility.Visible : Visibility.Collapsed;
         var text = vm.HeaderText;
         text.Inlines.Clear();
         var flags = TitleFlags(vm);
@@ -1315,23 +1793,62 @@ public partial class MainWindow : Window
                 });
             }
         }
-        try
+        // Cached (refreshed off-thread by RefreshAutoResumeState) — this runs on every title change, so it must never touch disk.
+        if (vm.AutoResumeContent is { Length: > 0 } autoResume)
         {
-            var autoResumePath = AppPaths.AutoResumeFile(vm.Info.Id);
-            if (File.Exists(autoResumePath))
-            {
-                vm.AutoResumeButton.Visibility = Visibility.Visible;
-                vm.AutoResumeButton.ToolTip = File.ReadAllText(autoResumePath).Trim();
-            }
-            else
-            {
-                vm.AutoResumeButton.Visibility = Visibility.Collapsed;
-            }
+            vm.AutoResumeButton.Visibility = Visibility.Visible;
+            vm.AutoResumeButton.ToolTip = autoResume;
         }
-        catch
+        else
         {
             vm.AutoResumeButton.Visibility = Visibility.Collapsed;
         }
+        // Title text changes header width, which can change which row each tab fits on.
+        RelayoutTabRows();
+    }
+
+    // Scrollback size of the current tab, shown next to the LLM stats.
+    private void UpdateScrollStats()
+    {
+        if (Active is not { } vm)
+        {
+            ScrollStatsText.Text = "";
+            return;
+        }
+        int lines;
+        long chars;
+        lock (vm.Screen.Sync)
+        {
+            lines = vm.Screen.TotalLines;
+            chars = vm.Screen.TotalChars();
+        }
+        ScrollStatsText.Text = $"{FormatCount(lines)} lines | {FormatSize(chars)}";
+    }
+
+    private static string FormatCount(long n)
+    {
+        if (n >= 1_000_000)
+        {
+            return $"{n / 1_000_000.0:0.#}M";
+        }
+        if (n >= 1_000)
+        {
+            return $"{n / 1_000.0:0.#}K";
+        }
+        return n.ToString();
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes >= 1024 * 1024)
+        {
+            return $"{bytes / (1024.0 * 1024.0):0.0}MB";
+        }
+        if (bytes >= 1024)
+        {
+            return $"{bytes / 1024.0:0}KB";
+        }
+        return $"{bytes}B";
     }
 
     private void UpdateWindowTitle()
@@ -1397,35 +1914,73 @@ public partial class MainWindow : Window
         return double.IsFinite(v) ? v : null;
     }
 
-    private void SyncTabsFromWindowFile()
+    // Reads the window file and each listed shell's state — pure disk reads, safe to run off the UI thread.
+    private List<(TabInfo Info, bool Alive)> ReadWindowFileAdoptions()
     {
+        var result = new List<(TabInfo, bool)>();
         try
         {
             var state = Termiot.WindowState.Load(_windowId);
-            bool added = false;
             foreach (var id in state.Shells)
             {
-                if (_tabs.Any(t => t.Info.Id == id) || !Directory.Exists(AppPaths.ShellDir(id)))
+                if (!Directory.Exists(AppPaths.ShellDir(id)))
                 {
                     continue;
                 }
                 var info = ShellInfo.Load(id) ?? new ShellInfo();
-                var tabInfo = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder };
-                // Ordered (--ensure --order) tabs land at their sorted position; unordered ones append.
-                int insertAt = tabInfo.EnsureOrder != 0 ? _tabs.TakeWhile(t => t.Info.EnsureOrder <= tabInfo.EnsureOrder).Count() : -1;
-                CreateTab(tabInfo, activate: false, start: HostInfo.IsShellAlive(id), insertIndex: insertAt);
-                added = true;
-                AppLog.Write("ui", $"sync: adopted shell {id} listed in window {_windowId}");
-            }
-            if (added)
-            {
-                SaveState();
+                var tabInfo = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks };
+                result.Add((tabInfo, HostInfo.IsShellAlive(id)));
             }
         }
         catch (Exception ex)
         {
-            AppLog.Write("ui", "window file sync failed: " + ex.Message);
+            AppLog.Write("ui", "window file sync read failed: " + ex.Message);
         }
+        return result;
+    }
+
+    private void ApplyWindowFileAdoptions(List<(TabInfo Info, bool Alive)> adopt)
+    {
+        bool added = false;
+        foreach (var (tabInfo, alive) in adopt)
+        {
+            if (_tabs.Any(t => t.Info.Id == tabInfo.Id))
+            {
+                continue;
+            }
+            // Ordered (--ensure --order) tabs land at their sorted position; unordered ones append.
+            int insertAt = tabInfo.EnsureOrder != 0 ? _tabs.TakeWhile(t => t.Info.EnsureOrder <= tabInfo.EnsureOrder).Count() : -1;
+            CreateTab(tabInfo, activate: false, start: alive, insertIndex: insertAt);
+            added = true;
+            AppLog.Write("ui", $"sync: adopted shell {tabInfo.Id} listed in window {_windowId}");
+        }
+        if (added)
+        {
+            SaveState();
+        }
+    }
+
+    // Synchronous adopt: the --ensure path looks the shell up immediately afterwards, so it must already be present.
+    private void SyncTabsFromWindowFile()
+    {
+        ApplyWindowFileAdoptions(ReadWindowFileAdoptions());
+    }
+
+    // Periodic sync: reads off the UI thread, then adopts and refreshes cached AUTORESUME state on it.
+    private void SyncTabsFromWindowFileAsync()
+    {
+        Task.Run(() =>
+        {
+            var adopt = ReadWindowFileAdoptions();
+            Dispatcher.BeginInvoke(() =>
+            {
+                ApplyWindowFileAdoptions(adopt);
+                foreach (var tab in _tabs)
+                {
+                    RefreshAutoResumeState(tab);
+                }
+            });
+        });
     }
 
     private void ScheduleSave()
@@ -1434,7 +1989,7 @@ public partial class MainWindow : Window
         _saveTimer.Start();
     }
 
-    private void SaveState(bool closedCleanly = false)
+    private void SaveState(bool closedCleanly = false, bool closing = false)
     {
         foreach (var tab in _tabs)
         {
@@ -1457,7 +2012,7 @@ public partial class MainWindow : Window
             OwnerPid = self.Id,
             OwnerStartTicks = self.StartTime.Ticks,
             ClosedCleanly = closedCleanly,
-            ClosedAtTicks = closedCleanly ? DateTime.UtcNow.Ticks : 0,
+            ClosedAtTicks = closing ? DateTime.UtcNow.Ticks : 0,
         }.Save(_windowId);
         foreach (var tab in _tabs)
         {
@@ -1468,24 +2023,25 @@ public partial class MainWindow : Window
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        bool Bound(string id) => Hotkeys.Matches(_settings, id, key, Keyboard.Modifiers);
         if (key == Key.Escape && _draggingVm is { } dragging)
         {
             e.Handled = true;
             CancelTabDrag(dragging.Header);
         }
-        else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.T)
+        else if (Bound("new-tab"))
         {
             e.Handled = true;
             OpenNewTab();
         }
-        else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.F)
+        else if (Bound("search"))
         {
             e.Handled = true;
             SearchBar.Visibility = Visibility.Visible;
             SearchBox.Focus();
             SearchBox.SelectAll();
         }
-        else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.N)
+        else if (Bound("new-window"))
         {
             e.Handled = true;
             string newWindowId = Program.NewId();
@@ -1498,7 +2054,7 @@ public partial class MainWindow : Window
             }.Save(newWindowId);
             Program.SpawnWindowProcess(newWindowId);
         }
-        else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.W)
+        else if (Bound("close-tab"))
         {
             e.Handled = true;
             if (Active is { } vm)
@@ -1506,23 +2062,29 @@ public partial class MainWindow : Window
                 CloseTab(vm);
             }
         }
-        else if (key == Key.Tab && Keyboard.Modifiers == ModifierKeys.Control && _tabs.Count > 0)
+        else if (Bound("next-tab") && _tabs.Count > 0)
         {
             e.Handled = true;
             ActivateTab((_active + 1) % _tabs.Count);
         }
-        else if (key == Key.Tab && Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift) && _tabs.Count > 0)
+        else if (Bound("prev-tab") && _tabs.Count > 0)
         {
             e.Handled = true;
             ActivateTab((_active - 1 + _tabs.Count) % _tabs.Count);
         }
-        else if (key == Key.Pause && (Keyboard.Modifiers & ModifierKeys.Alt) != 0)
+        else if (Bound("restart-shell"))
         {
             e.Handled = true;
             if (Active is { } restartVm)
             {
                 RestartShell(restartVm);
             }
+        }
+        else if ((key == Key.PageUp || key == Key.PageDown) && Active is { Screen: { } pgScreen } && !pgScreen.OnAltScreen)
+        {
+            // Scroll the scrollback; a full-screen app (alt-screen) gets the keys itself instead.
+            e.Handled = true;
+            Term.ScrollPage(key == Key.PageUp);
         }
         else if (key == Key.Enter && Keyboard.Modifiers == ModifierKeys.None && Term.HasSelection)
         {
@@ -1537,6 +2099,19 @@ public partial class MainWindow : Window
                 AppLog.Write("ui", "clipboard copy failed: " + ex.Message);
             }
             Term.ClearSelection();
+        }
+        else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.C && InputBox.IsKeyboardFocused && InputBox.SelectionLength > 0)
+        {
+            // Text selected in the input box is what the user wants copied — do that instead of falling through to the clear-input step.
+            e.Handled = true;
+            try
+            {
+                Clipboard.SetText(InputBox.SelectedText);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("ui", "clipboard copy failed: " + ex.Message);
+            }
         }
         else if (Keyboard.Modifiers == ModifierKeys.Control && key == Key.C && Term.HasSelection)
         {
@@ -1586,7 +2161,7 @@ public partial class MainWindow : Window
                 }
             }
         }
-        else if (!RawMode && !SearchBox.IsKeyboardFocused && ShouldForwardToShell(key, Keyboard.Modifiers) && Active is { Dead: false, Session: { } session } forwardVm)
+        else if (!RawMode && !SearchBox.IsKeyboardFocused && ShouldForwardToShell(key, Keyboard.Modifiers) && !IsInputEditingChord(key, Keyboard.Modifiers) && Active is { Dead: false, Session: { } session } forwardVm)
         {
             var encoded = forwardVm.Win32Input ? InputEncoder.EncodeWin32Key(key, Keyboard.Modifiers) : InputEncoder.Encode(key, Keyboard.Modifiers);
             if (encoded != null)
@@ -1596,6 +2171,16 @@ public partial class MainWindow : Window
                 Term.ScrollToBottom();
             }
         }
+    }
+
+    // Standard text-editing chords stay with the focused input editor instead of being forwarded to the shell: word navigation (Ctrl+arrows/Home/End), select-all, cut, undo/redo, word delete.
+    private bool IsInputEditingChord(Key key, ModifierKeys mods)
+    {
+        if (!InputBox.IsKeyboardFocused || (mods & ModifierKeys.Alt) != 0 || (mods & ModifierKeys.Control) == 0)
+        {
+            return false;
+        }
+        return key is Key.Left or Key.Right or Key.Home or Key.End or Key.A or Key.X or Key.Z or Key.Y or Key.Back or Key.Delete;
     }
 
     // Editor mode owns plain typing and its own editing keys; everything that is NOT regular typing (Ctrl/Alt chords like Ctrl+C, F-keys, Escape, paging) belongs to the underlying shell.
@@ -1685,6 +2270,7 @@ public partial class MainWindow : Window
             vm.PendingInput = InputBox.Text;
             ScheduleSave();
         }
+        AdjustInputHeight();
         RefreshCandidates();
     }
 
@@ -1752,12 +2338,27 @@ public partial class MainWindow : Window
         InputBox.Text = text;
         InputBox.CaretIndex = text.Length;
         _settingInputText = false;
+        AdjustInputHeight();
         // Any programmatic text change ends a history walk; the Up/Down handlers re-assign the index right after when the change IS the walk.
         _histIndex = -1;
         if (Active is { } vm)
         {
             vm.PendingInput = text;
         }
+    }
+
+    // Pin the input box to exactly the height its text wraps to. Left to auto-size, a WPF TextBox pads its desired height with a phantom trailing line for the caret at certain positions, so the box (and the whole input bar) grows and shrinks by a line as the caret moves — the jitter. LineCount reflects the wrapped text alone, independent of the caret, so a height derived from it stays put while the caret moves.
+    private void AdjustInputHeight()
+    {
+        if (InputBox.ActualWidth <= 0)
+        {
+            return;
+        }
+        // LineCount is only valid once the text has been laid out at the current width.
+        InputBox.UpdateLayout();
+        int lines = Math.Max(1, InputBox.LineCount);
+        double lineHeight = InputBox.FontFamily.LineSpacing * InputBox.FontSize;
+        InputBox.Height = Math.Ceiling(lineHeight * lines);
     }
 
     private void InputBox_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -1767,6 +2368,15 @@ public partial class MainWindow : Window
             case Key.Enter:
             {
                 e.Handled = true;
+                // Plain Enter submits, Shift/Ctrl+Enter inserts a newline — or the reverse with the swap setting.
+                bool modifiedEnter = (Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Shift)) != 0;
+                if (_settings.SwapEnterSubmit ? !modifiedEnter : modifiedEnter)
+                {
+                    int caret = InputBox.CaretIndex;
+                    InputBox.Text = InputBox.Text.Insert(caret, "\n");
+                    InputBox.CaretIndex = caret + 1;
+                    break;
+                }
                 var vm = Active;
                 string text = InputBox.Text;
                 if (vm is { Session: null })
@@ -1780,7 +2390,20 @@ public partial class MainWindow : Window
                     {
                         session.SendCommandMarker(text.Trim());
                     }
-                    session.SendText(text + "\r");
+                    if (vm.Win32Input)
+                    {
+                        // TUI apps with paste detection (Claude) treat one burst ending in \r as a paste containing a newline, not a submit. Send the text, then a genuine Enter key record after a beat so it reads as its own keypress.
+                        if (text.Length > 0)
+                        {
+                            session.SendInput(InputEncoder.EncodeWin32Text(text));
+                        }
+                        var enterRecord = InputEncoder.EncodeWin32Key(Key.Enter, ModifierKeys.None)!;
+                        Task.Delay(Win32EnterDelayMs).ContinueWith(_ => session.SendInput(enterRecord));
+                    }
+                    else
+                    {
+                        session.SendText(text + "\r");
+                    }
                     vm.History.Add(text);
                     if (text.Trim().Length > 0)
                     {
@@ -2259,6 +2882,7 @@ public partial class MainWindow : Window
         {
             SearchCount.Text = SearchBox.Text.Length > 0 ? "0/0" : "";
             Term.SetSearchResults(null);
+            Term.SetFilter(null);
             return;
         }
         int queryLen = SearchBox.Text.Length;
@@ -2275,7 +2899,79 @@ public partial class MainWindow : Window
         }
         SearchCount.Text = $"{_matchIndex + 1}/{_matches.Count}";
         Term.SetSearchResults(byLine);
+        BuildFilter();
         Term.ScrollToAbsLine(_matches[_matchIndex].Line);
+    }
+
+    private void FilterToggle_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_uiReady)
+        {
+            return;
+        }
+        BuildFilter();
+        if (_matches.Count > 0)
+        {
+            Term.ScrollToAbsLine(_matches[_matchIndex].Line);
+        }
+    }
+
+    // In filter mode, show only the matching lines plus the lines indented under each match (its subtree); blank lines don't break a subtree.
+    private void BuildFilter()
+    {
+        var vm = Active;
+        if (vm == null || FilterToggle.IsChecked != true || _matches.Count == 0)
+        {
+            Term.SetFilter(null);
+            return;
+        }
+        var matchLines = new SortedSet<int>();
+        foreach (var (line, _) in _matches)
+        {
+            matchLines.Add(line);
+        }
+        var show = new SortedSet<int>();
+        lock (vm.Screen.Sync)
+        {
+            int total = vm.Screen.TotalLines;
+            foreach (int m in matchLines)
+            {
+                if (m < 0 || m >= total)
+                {
+                    continue;
+                }
+                show.Add(m);
+                int mIndent = LeadingIndent(vm.Screen.GetLine(m).GetText());
+                for (int j = m + 1; j < total; j++)
+                {
+                    var text = vm.Screen.GetLine(j).GetText();
+                    if (text.Length == 0)
+                    {
+                        show.Add(j);
+                        continue;
+                    }
+                    if (LeadingIndent(text) > mIndent)
+                    {
+                        show.Add(j);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        Term.SetFilter(show.ToList());
+    }
+
+    private static int LeadingIndent(string text)
+    {
+        int i = 0;
+        while (i < text.Length && (text[i] == ' ' || text[i] == '\t'))
+        {
+            i++;
+        }
+        return i;
     }
 
     private void SearchBox_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -2302,7 +2998,9 @@ public partial class MainWindow : Window
     private void CloseSearch()
     {
         SearchBar.Visibility = Visibility.Collapsed;
+        FilterToggle.IsChecked = false;
         Term.SetSearchResults(null);
+        Term.SetFilter(null);
         FocusInput();
     }
 
@@ -2316,11 +3014,12 @@ public partial class MainWindow : Window
     // Tight tab strip: the + rides inline right after the last tab, and only when the tabs overflow do the scroll arrows and a fixed always-visible + appear.
     private void TabScroller_ScrollChanged(object sender, System.Windows.Controls.ScrollChangedEventArgs e)
     {
-        bool overflow = TabScroller.ScrollableWidth > 0.5;
+        // Wrap mode never scrolls — the capacity math guarantees fit, and the chrome must not flicker in on transient layout passes.
+        bool overflow = _settings.SingleRowTabs && TabScroller.ScrollableWidth > 0.5;
         ScrollLeftBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
         ScrollRightBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
         NewTabBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
-        NewTabInlineBtn.Visibility = overflow ? Visibility.Collapsed : Visibility.Visible;
+        _inlinePlus.Visibility = overflow ? Visibility.Collapsed : Visibility.Visible;
     }
 
     // The + button and Ctrl+T are the same action: a new tab in the current tab's directory.
@@ -2342,35 +3041,142 @@ public partial class MainWindow : Window
             AppLog.Write("ui", "reload: repo root unavailable: " + BuildInfo.RepoRoot);
             return;
         }
+        // Shift+Click skips the rebuild: take the window over with the newest already-staged build (the stable bat's target).
+        if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
+        {
+            SaveState();
+            var exe = StableLauncher.CurrentTarget();
+            if (exe == null || !File.Exists(exe))
+            {
+                exe = Environment.ProcessPath!;
+            }
+            try
+            {
+                var fast = new ProcessStartInfo(exe) { UseShellExecute = false };
+                fast.ArgumentList.Add("--window");
+                fast.ArgumentList.Add(_windowId);
+                fast.ArgumentList.Add("--resume");
+                fast.ArgumentList.Add("--takeover");
+                Process.Start(fast);
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("ui", "fast reload failed: " + ex);
+            }
+            return;
+        }
         SaveState();
-        ReloadBtn.Content = "⏳";
-        ReloadBtn.IsEnabled = false;
+        SetReloadBuilding(true);
+        StartReloadBuild();
+    }
+
+    private void SetReloadBuilding(bool building)
+    {
+        ReloadBtn.Content = building ? "⏳" : "⟳";
+        ReloadBtn.IsEnabled = !building;
+    }
+
+    // Runs `yarn reload-window`, streaming its output into the build log (overwritten each run) for the button tooltip and the settings view. A successful build spawns a takeover process that kills this window; a failure, a spawn error, or a wedged build that hits the timeout all restore the button instead of leaving the hourglass stuck forever.
+    private void StartReloadBuild()
+    {
+        var logPath = AppPaths.BuildLogFile;
+        var header = $"=== reload started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===";
+        var tail = new Queue<string>();
+        var gate = new object();
+        try
+        {
+            File.WriteAllText(logPath, header + Environment.NewLine);
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("ui", "build log init failed: " + ex.Message);
+        }
+        void AppendLine(string line)
+        {
+            lock (gate)
+            {
+                tail.Enqueue(line);
+                while (tail.Count > BuildLogTooltipTailLines)
+                {
+                    tail.Dequeue();
+                }
+                try
+                {
+                    File.AppendAllText(logPath, line + Environment.NewLine);
+                }
+                catch
+                {
+                }
+                var tip = header + Environment.NewLine + string.Join(Environment.NewLine, tail);
+                Dispatcher.BeginInvoke(() => ReloadBtn.ToolTip = tip);
+            }
+        }
+
         var psi = new ProcessStartInfo("cmd.exe")
         {
             WorkingDirectory = BuildInfo.RepoRoot,
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
         };
         psi.ArgumentList.Add("/c");
         psi.ArgumentList.Add("yarn");
         psi.ArgumentList.Add("reload-window");
         psi.ArgumentList.Add(_windowId);
+
+        Process proc;
         try
         {
-            Process.Start(psi);
-            // Still being alive after this long means the build failed (success kills this process) — restore the button so reload can be retried.
-            Task.Delay(TimeSpan.FromSeconds(90)).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
+            proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            proc.OutputDataReceived += (_, e) =>
             {
-                ReloadBtn.Content = "⟳";
-                ReloadBtn.IsEnabled = true;
-            }));
+                if (e.Data != null)
+                {
+                    AppendLine(e.Data);
+                }
+            };
+            proc.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data != null)
+                {
+                    AppendLine(e.Data);
+                }
+            };
+            proc.Exited += (_, _) =>
+            {
+                AppendLine($"=== exited with code {proc.ExitCode} ===");
+                Dispatcher.BeginInvoke(() => SetReloadBuilding(false));
+            };
+            proc.Start();
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
         }
         catch (Exception ex)
         {
             AppLog.Write("ui", "reload spawn failed: " + ex);
-            ReloadBtn.Content = "⟳";
-            ReloadBtn.IsEnabled = true;
+            AppendLine("=== failed to start build: " + ex.Message + " ===");
+            SetReloadBuilding(false);
+            return;
         }
+
+        // The timeout reads proc.HasExited (never disposed, so this stays valid) — a wedged build is killed tree-and-all so the button recovers.
+        Task.Delay(TimeSpan.FromMinutes(ReloadTimeoutMinutes)).ContinueWith(_ =>
+        {
+            try
+            {
+                if (proc.HasExited)
+                {
+                    return;
+                }
+                proc.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+            }
+            AppendLine($"=== TIMED OUT after {ReloadTimeoutMinutes} minutes — build killed ===");
+            Dispatcher.BeginInvoke(() => SetReloadBuilding(false));
+        });
     }
 
     private SettingsWindow OpenSettings()
@@ -2402,6 +3208,7 @@ public partial class MainWindow : Window
             tab.Screen.ScrollbackCap = _settings.ScrollbackLines;
             tab.ResourceRow.Visibility = _settings.ShowTabResources ? Visibility.Visible : Visibility.Collapsed;
         }
+        RelayoutTabRows();
     }
 
     private void CenterOverWindow(IntPtr reference)

@@ -3,7 +3,7 @@ using System.IO;
 
 namespace Termiot;
 
-// Frames are [type:1][payloadLength:4][payload]. Client → host: Hello(long replayFromOffset), Input(raw pty bytes), Resize(int cols, int rows), Shutdown (terminate the shell; its folder stays on disk for resurrection), Detach (clean disconnect — do not treat as a window crash), Associate(int windowPid, long windowStartTicks, utf8 windowId — the window this shell now belongs to, for the orphan liveness check). Host → client: Output(raw pty bytes), Exited(int code).
+// Frames are [type:1][payloadLength:4][payload]. Client → host: Hello(long ignored, long recentBytes — the host sends its most recent recentBytes as a single ReplayRecent frame; the client reads the rest of the history from the log file itself), Input(raw pty bytes), Resize(int cols, int rows), Shutdown (terminate the shell; its folder stays on disk for resurrection), Detach (clean disconnect — do not treat as a window crash), Associate(int windowPid, long windowStartTicks, utf8 windowId — the window this shell now belongs to, for the orphan liveness check). Host → client: ReplayRecent(recent tail, overlap-joined by the client), Output(live pty bytes), Exited(int code).
 public static class PipeProtocol
 {
     public const byte MsgHello = 1;
@@ -16,6 +16,11 @@ public static class PipeProtocol
     public const byte MsgAssociate = 8;
     // Client → host: the renderer is about to send this command as input. The host embeds it into the output stream as an APC escape sequence (ESC _ termiot-cmd:<base64> ESC \), which structures the otherwise-flat log into command/output pairs while staying invisible to the terminal — parsers consume APC strings without rendering, and replay keeps the markers aligned with the output they precede.
     public const byte MsgCommandMarker = 9;
+    // Host → client, staged restore: after the recent tail is sent as MsgOutput (parsed straight into the live screen for an instant view), the OLDER bytes are sent as MsgReplayHead so the client can parse them on a background thread into a scratch screen and prepend the result as scrollback — never touching the live parser. MsgReplayHeadEnd marks the end so the client finalizes the prepend. A client that only sends the legacy 8-byte Hello never receives these (the host falls back to a plain in-order MsgOutput replay).
+    // Host → client: the most recent slice of the log (the client reads the bulk of the history from the file itself; this covers the tail, including anything the host hasn't flushed yet, and the client overlap-joins it onto its file read). 10/11 are retired (formerly a full-history stream) and simply ignored if an older host sends them.
+    public const byte MsgReplayRecent = 12;
+    // Host → client, once on connect: payload[0] = 1 if the host process is elevated (running as administrator).
+    public const byte MsgHostElevated = 13;
 
     // A malformed or hostile peer can put anything in the length field; cap it so we drop the connection instead of attempting a huge allocation.
     public const int MaxFrameBytes = 16 * 1024 * 1024;

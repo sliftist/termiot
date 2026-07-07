@@ -36,7 +36,52 @@ public sealed class TerminalControl : FrameworkElement
     private TermScreen? _screen;
     private int _scrollOffset;
     private int _lastFirstAbs;
+    private int _lastTotal;
     private Dictionary<int, List<SearchSpan>>? _searchByLine;
+
+    // Filter mode: when set, only these absolute line indices are shown (search matches + their indented children). _rowAbs maps each on-screen row to the absolute line it currently shows (or -1), so selection/hover work in both modes.
+    private List<int>? _filter;
+    private int[] _rowAbs = Array.Empty<int>();
+
+    public void SetFilter(List<int>? absLines)
+    {
+        _filter = absLines is { Count: > 0 } ? absLines : null;
+        _scrollOffset = 0;
+        RenderFrame();
+    }
+
+    private int RowToAbs(int row)
+    {
+        if (row >= 0 && row < _rowAbs.Length && _rowAbs[row] >= 0)
+        {
+            return _rowAbs[row];
+        }
+        return _screen != null ? Math.Max(0, _screen.TotalLines - 1) : 0;
+    }
+
+    // The scrollbar is a separate element (laid out in its own gutter); it reads this state and is repainted whenever the terminal repaints.
+    public TerminalScrollbar? Scrollbar;
+    public int ScrollTotal => _lastTotal;
+    public int ScrollFirstAbs => _lastFirstAbs;
+    // Match ticks map to absolute line indices, which only line up with the scrollbar in the normal (unfiltered) view.
+    public IEnumerable<int>? SearchMatchLines => _filter is { Count: > 0 } ? null : _searchByLine?.Keys;
+
+    // Scroll so that the given fraction of the whole buffer sits at the top of the viewport (driven by the scrollbar drag).
+    public void ScrollToFraction(double frac)
+    {
+        if (_screen == null)
+        {
+            return;
+        }
+        lock (_screen.Sync)
+        {
+            int total = EffectiveTotalLines();
+            _lastTotal = total;
+            int firstAbs = (int)Math.Round(frac * total);
+            _scrollOffset = Math.Clamp(total - _rows - firstAbs, 0, Math.Max(0, total - _rows));
+        }
+        RenderFrame();
+    }
     private bool _selecting;
     private bool _hasSelection;
     private (int Line, int Col) _selAnchor;
@@ -76,6 +121,7 @@ public sealed class TerminalControl : FrameworkElement
         _screen = screen;
         _scrollOffset = 0;
         _searchByLine = null;
+        _filter = null;
         ClearSelection();
         if (_cols > 0 && _rows > 0)
         {
@@ -96,6 +142,20 @@ public sealed class TerminalControl : FrameworkElement
         RenderFrame();
     }
 
+    // Scroll by whole lines (positive = up into scrollback); clamped in RenderFrame.
+    public void ScrollByLines(int lines)
+    {
+        _scrollOffset += lines;
+        RenderFrame();
+    }
+
+    // Page up/down keeps one row of overlap for continuity.
+    public void ScrollPage(bool up)
+    {
+        int page = Math.Max(1, _rows - 1);
+        ScrollByLines(up ? page : -page);
+    }
+
     public void ScrollToAbsLine(int absLine)
     {
         if (_screen == null)
@@ -104,8 +164,20 @@ public sealed class TerminalControl : FrameworkElement
         }
         lock (_screen.Sync)
         {
-            int total = EffectiveTotalLines();
-            _scrollOffset = Math.Clamp(total - _rows - (absLine - _rows / 2), 0, Math.Max(0, total - _rows));
+            int total;
+            int pos;
+            if (_filter is { Count: > 0 })
+            {
+                total = _filter.Count;
+                int i = _filter.BinarySearch(absLine);
+                pos = Math.Clamp(i < 0 ? ~i : i, 0, total - 1);
+            }
+            else
+            {
+                total = EffectiveTotalLines();
+                pos = absLine;
+            }
+            _scrollOffset = Math.Clamp(total - _rows - (pos - _rows / 2), 0, Math.Max(0, total - _rows));
         }
         RenderFrame();
     }
@@ -179,15 +251,29 @@ public sealed class TerminalControl : FrameworkElement
         Array.Fill(_pix, unchecked((int)Palette.DefaultBg));
         lock (_screen.Sync)
         {
-            int total = EffectiveTotalLines();
+            // Filter mode shows only a chosen subset of lines (search matches and their indented children); the "content" is then the filter list rather than the contiguous buffer.
+            bool filtered = _filter is { Count: > 0 };
+            int total = filtered ? _filter!.Count : EffectiveTotalLines();
             _scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, total - _rows));
-            int firstAbs = total - _rows - _scrollOffset;
-            _lastFirstAbs = firstAbs;
+            int first = total - _rows - _scrollOffset;
+            _lastFirstAbs = first;
+            _lastTotal = total;
+            if (_rowAbs.Length != _rows)
+            {
+                _rowAbs = new int[_rows];
+            }
             int cursorAbs = _screen.ScrollbackCount + _screen.CursorY;
             for (int r = 0; r < _rows; r++)
             {
-                int abs = firstAbs + r;
-                if (abs < 0 || abs >= total)
+                int idx = first + r;
+                if (idx < 0 || idx >= total)
+                {
+                    _rowAbs[r] = -1;
+                    continue;
+                }
+                int abs = filtered ? _filter![idx] : idx;
+                _rowAbs[r] = abs;
+                if (abs < 0 || abs >= _screen.TotalLines)
                 {
                     continue;
                 }
@@ -200,7 +286,7 @@ public sealed class TerminalControl : FrameworkElement
                     DrawCell(r, c, line.Cells[c], spans, IsSelected(abs, c), IsHoveredLink(abs, c));
                 }
             }
-            if (ShowTermCursor && _scrollOffset == 0 && _screen.CursorVisible)
+            if (!filtered && ShowTermCursor && _scrollOffset == 0 && _screen.CursorVisible)
             {
                 // A moving cursor resets the blink phase to visible so it never disappears mid-typing.
                 var cursorPos = (cursorAbs, _screen.CursorX);
@@ -211,7 +297,7 @@ public sealed class TerminalControl : FrameworkElement
                     _blinkTimer.Stop();
                     _blinkTimer.Start();
                 }
-                int cursorRow = cursorAbs - firstAbs;
+                int cursorRow = cursorAbs - first;
                 if (_blinkOn && cursorRow >= 0 && cursorRow < _rows)
                 {
                     DrawCursorBar(cursorRow, _screen.CursorX);
@@ -220,6 +306,7 @@ public sealed class TerminalControl : FrameworkElement
         }
         _bmp.WritePixels(new Int32Rect(0, 0, _pxWidth, _pxHeight), _pix, _pxWidth * 4, 0);
         InvalidateVisual();
+        Scrollbar?.InvalidateVisual();
         _frameCount++;
         _frameTicks += System.Diagnostics.Stopwatch.GetTimestamp() - renderStart;
         if (!_firstFrameMarked)
@@ -452,7 +539,7 @@ public sealed class TerminalControl : FrameworkElement
         int line;
         lock (_screen.Sync)
         {
-            line = Math.Clamp(_lastFirstAbs + row, 0, Math.Max(0, _screen.TotalLines - 1));
+            line = Math.Clamp(RowToAbs(row), 0, Math.Max(0, _screen.TotalLines - 1));
         }
         return (line, col);
     }
@@ -600,7 +687,7 @@ public sealed class TerminalControl : FrameworkElement
         string? desc = null;
         lock (_screen.Sync)
         {
-            int abs = _lastFirstAbs + row;
+            int abs = RowToAbs(row);
             if (abs >= 0 && abs < _screen.TotalLines)
             {
                 var annotations = _screen.GetLine(abs).Annotations;

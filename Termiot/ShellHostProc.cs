@@ -10,8 +10,8 @@ namespace Termiot;
 // One host process per shell instance. It owns the ConPTY running cmd.exe and appends every output byte to shells\<id>\output.log, which doubles as the persisted shell state: a window replays the log on connect, so watching-window changes, window restarts, and cold resurrections all restore the scrollback. The host knows which window process owns it (via Associate) and checks that window's liveness every 5 seconds — a shell whose window is gone terminates itself so nothing is ever orphaned; its folder stays on disk, and the next window process to open either reuses the still-live host or offers to resume from the persisted state.
 public static class ShellHostProc
 {
-    private const long MaxLogBytes = 64L * 1024 * 1024;
-    private const long TrimTargetBytes = 48L * 1024 * 1024;
+    // Each of the two rotating log files is capped here; total retained history is up to two of these.
+    private const long MaxActiveLogBytes = 10L * 1024 * 1024;
     private const int PtyReadBufferBytes = 64 * 1024;
     private const int ReplayChunkBytes = 64 * 1024;
     private const int DefaultCols = 120;
@@ -34,6 +34,9 @@ public static class ShellHostProc
     private static NamedPipeServerStream? _client;
     private static IPtySession _pty = null!;
     private static string _logPath = null!;
+    private static string _prevLogPath = null!;
+    // Bytes currently in the active log file; guarded by IoLock. Drives rotation.
+    private static long _activeLen;
     private static string _shellId = null!;
     private static readonly BlockingCollection<byte[]> PtyInputQueue = new(new ConcurrentQueue<byte[]>(), PtyInputQueueCap);
 
@@ -73,7 +76,11 @@ public static class ShellHostProc
         _shellId = shellId;
         Directory.CreateDirectory(AppPaths.ShellDir(shellId));
         _logPath = AppPaths.LogFile(shellId);
-        TrimLog();
+        _prevLogPath = AppPaths.PrevLogFile(shellId);
+        // Migrate any oversized file (pre-rotation single log, or a crash-bloated one) down to the cap.
+        TrimToCap(_prevLogPath);
+        TrimToCap(_logPath);
+        _activeLen = FileLen(_logPath);
         HostInfo.SaveCurrentProcess(shellId);
         _writeLogImmediately = AppSettings.Load().WriteLogImmediately;
     }
@@ -147,17 +154,32 @@ public static class ShellHostProc
         {
             return;
         }
-        long offset = BinaryPrimitives.ReadInt64LittleEndian(h.Payload);
-        lock (IoLock)
+        // The client reads the bulk of the history from the log file itself; we only send it the most recent slice (default if unspecified), which it overlap-joins onto its file read. No megabytes over the pipe.
+        long recentBytes = h.Payload.Length >= 16 ? BinaryPrimitives.ReadInt64LittleEndian(h.Payload.AsSpan(8)) : 128L * 1024;
+        if (recentBytes <= 0)
         {
-            FlushLogLocked();
+            recentBytes = 128L * 1024;
         }
-        // The bulk replay runs OUTSIDE IoLock: a slow-draining client must not stall log flushes, the pty reader, or termination. The short locked pass afterwards catches bytes appended mid-replay and atomically promotes the client to live-forwarding.
-        long pos = ReplayRange(server, offset, long.MaxValue);
+        long prevLen, activeLen;
+        byte[] recent;
         lock (IoLock)
         {
             FlushLogLocked();
-            ReplayRange(server, pos, long.MaxValue);
+            prevLen = FileLen(_prevLogPath);
+            activeLen = _activeLen;
+            long combined = prevLen + activeLen;
+            recent = ReadLogicalBytes(Math.Max(0, combined - recentBytes), combined, prevLen);
+        }
+        PipeProtocol.WriteFrame(server, PipeProtocol.MsgHostElevated, new[] { (byte)(IsElevated() ? 1 : 0) });
+        PipeProtocol.WriteFrame(server, PipeProtocol.MsgReplayRecent, recent);
+        lock (IoLock)
+        {
+            FlushLogLocked();
+            // Anything appended while we were sending the recent slice: forward it live so no bytes are missed, then promote to live-forwarding.
+            if (_activeLen > activeLen)
+            {
+                ReplayLogical(server, prevLen + activeLen, prevLen + _activeLen, PipeProtocol.MsgOutput, prevLen);
+            }
             _client = server;
         }
         while (true)
@@ -277,23 +299,26 @@ public static class ShellHostProc
         }
     }
 
-    // Returns the file position reached. Reads the log without holding any lock; each chunk is read via a fresh open-read-close.
-    private static long ReplayRange(NamedPipeServerStream server, long from, long to)
+    // Sends the logical byte range [from, to) — positions run across the previous file then the active file as one continuous stream — each chunk framed as msgType. prevLen is the snapshot boundary between the two files. Reads without holding any lock, fresh open-read-close per chunk; a short read (e.g. a file that rotated out mid-replay) just stops early.
+    private static long ReplayLogical(NamedPipeServerStream server, long from, long to, byte msgType, long prevLen)
     {
-        long pos = from;
+        long pos = Math.Max(0, from);
         var buf = new byte[ReplayChunkBytes];
         while (pos < to)
         {
+            string path = pos < prevLen ? _prevLogPath : _logPath;
+            long localPos = pos < prevLen ? pos : pos - prevLen;
+            long segEnd = pos < prevLen ? Math.Min(to, prevLen) : to;
             int n;
             try
             {
-                using var rs = new FileStream(_logPath, FileMode.OpenOrCreate, FileAccess.Read, FileShare.ReadWrite);
-                if (pos < 0 || pos > rs.Length)
+                using var rs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Read, FileShare.ReadWrite);
+                if (localPos > rs.Length)
                 {
-                    pos = 0;
+                    break;
                 }
-                rs.Position = pos;
-                n = rs.Read(buf, 0, (int)Math.Min(buf.Length, to - pos));
+                rs.Position = localPos;
+                n = rs.Read(buf, 0, (int)Math.Min(buf.Length, segEnd - pos));
             }
             catch (Exception ex)
             {
@@ -304,7 +329,7 @@ public static class ShellHostProc
             {
                 break;
             }
-            PipeProtocol.WriteFrame(server, PipeProtocol.MsgOutput, buf.AsSpan(0, n));
+            PipeProtocol.WriteFrame(server, msgType, buf.AsSpan(0, n));
             pos += n;
         }
         return pos;
@@ -449,9 +474,14 @@ public static class ShellHostProc
         }
         try
         {
-            using var log = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-            log.Write(PendingLog.GetBuffer(), 0, (int)PendingLog.Length);
+            long added = PendingLog.Length;
+            using (var log = new FileStream(_logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+            {
+                log.Write(PendingLog.GetBuffer(), 0, (int)PendingLog.Length);
+            }
             PendingLog.SetLength(0);
+            _activeLen += added;
+            RotateIfNeeded();
         }
         catch (Exception ex)
         {
@@ -459,23 +489,113 @@ public static class ShellHostProc
         }
     }
 
-    private static void TrimLog()
+    // When the active file passes the cap, discard the previous file and rotate the active one into its place; a fresh active file starts on the next write. Retained history stays within two caps. Called under IoLock.
+    private static void RotateIfNeeded()
+    {
+        if (_activeLen <= MaxActiveLogBytes)
+        {
+            return;
+        }
+        try
+        {
+            File.Delete(_prevLogPath);
+            File.Move(_logPath, _prevLogPath);
+            _activeLen = 0;
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("shellhost", "log rotate failed: " + ex.Message);
+        }
+    }
+
+    private static long FileLen(string path)
     {
         try
         {
-            var info = new FileInfo(_logPath);
-            if (!info.Exists || info.Length <= MaxLogBytes)
+            var info = new FileInfo(path);
+            return info.Exists ? info.Length : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static bool IsElevated()
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            return new System.Security.Principal.WindowsPrincipal(identity).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Read the logical byte range [from, to) across the previous file then the active file into one buffer (for the small recent slice sent to a connecting client).
+    private static byte[] ReadLogicalBytes(long from, long to, long prevLen)
+    {
+        if (to <= from)
+        {
+            return Array.Empty<byte>();
+        }
+        var result = new byte[to - from];
+        int written = 0;
+        long pos = from;
+        while (pos < to)
+        {
+            string path = pos < prevLen ? _prevLogPath : _logPath;
+            long localPos = pos < prevLen ? pos : pos - prevLen;
+            long segEnd = pos < prevLen ? Math.Min(to, prevLen) : to;
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                if (localPos >= fs.Length)
+                {
+                    break;
+                }
+                fs.Position = localPos;
+                int want = (int)Math.Min(segEnd - pos, fs.Length - localPos);
+                int got = fs.Read(result, written, want);
+                if (got <= 0)
+                {
+                    break;
+                }
+                written += got;
+                pos += got;
+            }
+            catch
+            {
+                break;
+            }
+        }
+        if (written < result.Length)
+        {
+            Array.Resize(ref result, written);
+        }
+        return result;
+    }
+
+    // Bound a single log file to the cap by keeping only its last MaxActiveLogBytes — used at startup to migrate a pre-rotation (or crash-bloated) file down to size.
+    private static void TrimToCap(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists || info.Length <= MaxActiveLogBytes)
             {
                 return;
             }
             byte[] tail;
-            using (var rs = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var rs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
-                rs.Position = rs.Length - TrimTargetBytes;
-                tail = new byte[TrimTargetBytes];
+                rs.Position = rs.Length - MaxActiveLogBytes;
+                tail = new byte[MaxActiveLogBytes];
                 rs.ReadExactly(tail);
             }
-            File.WriteAllBytes(_logPath, tail);
+            File.WriteAllBytes(path, tail);
         }
         catch (Exception ex)
         {

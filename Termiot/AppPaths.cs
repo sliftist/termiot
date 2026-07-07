@@ -10,6 +10,8 @@ public static class AppPaths
     public static readonly string WindowsDir = Path.Combine(Root, "windows");
     public static readonly string SettingsFile = Path.Combine(Root, "settings.json");
     public static readonly string AppLogFile = Path.Combine(Root, "app.log");
+    // Output of the most recent rebuild-button run — overwritten each click so it's always the latest, surfaced in the reload button's tooltip and the settings window.
+    public static readonly string BuildLogFile = Path.Combine(Root, "build.log");
     public static readonly string UnhandledEscapesFile = Path.Combine(Root, "unhandled-escapes.md");
 
     static AppPaths()
@@ -20,7 +22,10 @@ public static class AppPaths
 
     public static string ShellDir(string shellId) => Path.Combine(ShellsDir, shellId);
 
+    // The shell output is kept in two rotating files: output.log is the active file being appended; when it exceeds the cap it's rotated to output.1.log (the older one is discarded), so total retained history is bounded. Replay reads output.1.log then output.log in order.
     public static string LogFile(string shellId) => Path.Combine(ShellDir(shellId), "output.log");
+
+    public static string PrevLogFile(string shellId) => Path.Combine(ShellDir(shellId), "output.1.log");
 
     public static string ShellInfoFile(string shellId) => Path.Combine(ShellDir(shellId), "shell.json");
 

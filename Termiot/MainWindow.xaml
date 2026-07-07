@@ -7,28 +7,28 @@
         Background="#FF000000"
         UseLayoutRounding="True">
   <DockPanel>
-    <Border DockPanel.Dock="Top" Background="#FF222222">
-      <DockPanel>
-        <Button x:Name="ReloadBtn" DockPanel.Dock="Right" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones)" />
-        <Button x:Name="SettingsBtn" DockPanel.Dock="Right" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
-        <TextBlock x:Name="BuildTimeText" DockPanel.Dock="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
-        <TextBlock x:Name="FpsText" DockPanel.Dock="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0,0,0" ToolTip="Painted frames last second (output-driven; idle is 0) · average cost of one full render · the fps that cost could sustain" />
-        <TextBox x:Name="WindowNameBox" DockPanel.Dock="Right" MinWidth="50" VerticalAlignment="Center" Margin="6,0,0,0" Background="Transparent" Foreground="#FF9A9AC8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontSize="11" TextChanged="WindowNameBox_TextChanged" ToolTip="Window name — targetable from launches via --ensure --window &lt;name&gt;" />
-        <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" Visibility="Collapsed" />
-        <Button x:Name="ScrollRightBtn" DockPanel.Dock="Right" Content="▶" Click="ScrollRightBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
-        <Button x:Name="ScrollLeftBtn" DockPanel.Dock="Left" Content="◀" Click="ScrollLeftBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
-        <ScrollViewer x:Name="TabScroller" HorizontalAlignment="Left" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" PreviewMouseWheel="TabScroller_PreviewMouseWheel" ScrollChanged="TabScroller_ScrollChanged">
-          <Grid>
-            <StackPanel Orientation="Horizontal">
-              <StackPanel x:Name="TabStrip" Orientation="Horizontal" />
-              <Button x:Name="NewTabInlineBtn" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" />
-            </StackPanel>
-            <Canvas IsHitTestVisible="False">
-              <Rectangle x:Name="DropIndicator" Width="3" Fill="#FF4EC94E" Visibility="Collapsed" />
-            </Canvas>
-          </Grid>
-        </ScrollViewer>
-      </DockPanel>
+    <Border x:Name="TabBar" DockPanel.Dock="Top" Background="#FF141414">
+      <Grid>
+        <StackPanel x:Name="TabBarRows">
+          <DockPanel x:Name="TopRowDock">
+            <Button x:Name="ReloadBtn" DockPanel.Dock="Right" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones). Shift+Click: reload onto the newest existing build without rebuilding." />
+            <Button x:Name="SettingsBtn" DockPanel.Dock="Right" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
+            <TextBlock x:Name="BuildTimeText" DockPanel.Dock="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
+            <!-- Fixed width + right alignment: the readout changes every second, so a content-sized box would reflow the window name and tab strip on each tick. -->
+            <TextBlock x:Name="FpsText" DockPanel.Dock="Right" Width="170" TextAlignment="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0,0,0" ToolTip="Painted frames last second (output-driven; idle is 0) · average cost of one full render · the fps that cost could sustain" />
+            <TextBox x:Name="WindowNameBox" DockPanel.Dock="Right" MinWidth="50" VerticalAlignment="Center" Margin="6,0,0,0" Background="Transparent" Foreground="#FF9A9AC8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontSize="11" TextChanged="WindowNameBox_TextChanged" ToolTip="Window name — targetable from launches via --ensure --window &lt;name&gt;" />
+            <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" Visibility="Collapsed" />
+            <Button x:Name="ScrollRightBtn" DockPanel.Dock="Right" Content="▶" Click="ScrollRightBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
+            <Button x:Name="ScrollLeftBtn" DockPanel.Dock="Left" Content="◀" Click="ScrollLeftBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
+            <ScrollViewer x:Name="TabScroller" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" PreviewMouseWheel="TabScroller_PreviewMouseWheel" ScrollChanged="TabScroller_ScrollChanged">
+              <StackPanel x:Name="TabStrip" Orientation="Horizontal" HorizontalAlignment="Left" />
+            </ScrollViewer>
+          </DockPanel>
+        </StackPanel>
+        <Canvas IsHitTestVisible="False">
+          <Rectangle x:Name="DropIndicator" Width="3" Fill="#FF4EC94E" Visibility="Collapsed" />
+        </Canvas>
+      </Grid>
     </Border>
     <Border x:Name="InputBar" DockPanel.Dock="Bottom" Background="#FF1D1D1D" Padding="8,4,8,6">
       <Grid>
@@ -39,6 +39,7 @@
         </Grid.RowDefinitions>
         <DockPanel x:Name="CwdRow" Grid.Row="0" Margin="0,0,0,2">
           <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+            <TextBlock x:Name="ScrollStatsText" Foreground="#FF777777" FontFamily="Consolas" FontSize="12" VerticalAlignment="Center" Margin="0,0,12,0" ToolTip="Scrollback buffer of the current tab (lines | characters)" />
             <TextBlock x:Name="LlmCostText" Foreground="#FF999999" FontFamily="Consolas" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0" />
             <CheckBox x:Name="LlmToggle" Content="LLM autocomplete" Foreground="#FF999999" VerticalAlignment="Center" Checked="LlmToggle_Changed" Unchecked="LlmToggle_Changed" />
             <CheckBox x:Name="MultiToggle" Content="multi-complete" Foreground="#FF999999" VerticalAlignment="Center" Margin="10,0,0,0" Checked="MultiToggle_Changed" Unchecked="MultiToggle_Changed" />
@@ -49,7 +50,8 @@
           <CheckBox x:Name="RawToggle" DockPanel.Dock="Right" Content="raw keys" Foreground="#FF999999" VerticalAlignment="Center" Margin="10,0,0,0" Checked="RawToggle_Changed" Unchecked="RawToggle_Changed" />
           <Grid>
             <Grid x:Name="EditorArea">
-              <TextBox x:Name="InputBox" Background="Transparent" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" Padding="0" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" TextChanged="InputBox_TextChanged" PreviewKeyDown="InputBox_PreviewKeyDown" />
+              <!-- The right padding keeps the end-of-line caret from phantom-wrapping onto a second line (which makes the box's height jitter while the caret moves). -->
+              <TextBox x:Name="InputBox" Background="Transparent" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" Padding="0,0,12,0" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" TextWrapping="Wrap" TextChanged="InputBox_TextChanged" PreviewKeyDown="InputBox_PreviewKeyDown" />
             </Grid>
             <TextBlock x:Name="RawKeysText" Visibility="Collapsed" Foreground="#FF8A8A8A" FontFamily="Consolas" FontSize="13" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
           </Grid>
@@ -58,7 +60,11 @@
       </Grid>
     </Border>
     <Grid>
-      <ui:TerminalControl x:Name="Term" />
+      <DockPanel>
+        <!-- Scrollbar in its own gutter, flush with the right edge, with padding kept between it and the text. -->
+        <ui:TerminalScrollbar x:Name="Scrollbar" DockPanel.Dock="Right" Width="8" Margin="4,1,4,1" />
+        <ui:TerminalControl x:Name="Term" Margin="4,1,0,1" />
+      </DockPanel>
       <Border x:Name="ResumeOverlay" Visibility="Collapsed" Background="#FF000000">
         <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="700">
           <TextBlock Text="This shell has terminated. Its output and directory are saved." Foreground="#FFCCCCCC" FontSize="14" HorizontalAlignment="Center" />
@@ -69,9 +75,41 @@
           </StackPanel>
         </StackPanel>
       </Border>
+      <Border x:Name="LoadingOverlay" Visibility="Collapsed" Background="#FF000000">
+        <TextBlock Text="Loading…" Foreground="#FF999999" FontSize="14" HorizontalAlignment="Center" VerticalAlignment="Center" />
+      </Border>
       <Border x:Name="SearchBar" Visibility="Collapsed" HorizontalAlignment="Right" VerticalAlignment="Top" Background="#FF2D2D2D" BorderBrush="#FF555555" BorderThickness="1" Margin="0,4,20,0" Padding="6,4">
         <StackPanel Orientation="Horizontal">
           <TextBox x:Name="SearchBox" Width="240" Background="#FF1E1E1E" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontFamily="Consolas" FontSize="13" TextChanged="SearchBox_TextChanged" PreviewKeyDown="SearchBox_PreviewKeyDown" />
+          <ToggleButton x:Name="FilterToggle" Content="filter" Margin="6,0,0,0" Padding="8,1" VerticalAlignment="Center" FontSize="12" Foreground="#FFCCCCCC"
+                        ToolTip="Filter: show only matching lines and the lines indented under them"
+                        Checked="FilterToggle_Changed" Unchecked="FilterToggle_Changed">
+            <ToggleButton.Template>
+              <ControlTemplate TargetType="ToggleButton">
+                <Border x:Name="bd" Background="#FF2D2D2D" BorderBrush="#FF555555" BorderThickness="1" CornerRadius="2" Padding="{TemplateBinding Padding}">
+                  <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" TextElement.Foreground="{TemplateBinding Foreground}" />
+                </Border>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="bd" Property="Background" Value="#FF3A3A3A" />
+                  </Trigger>
+                  <Trigger Property="IsChecked" Value="True">
+                    <!-- Toggled on: darker, inset (top-shadow gradient), accent text. -->
+                    <Setter Property="Foreground" Value="#FF6FA8DC" />
+                    <Setter TargetName="bd" Property="BorderBrush" Value="#FF2A2A2A" />
+                    <Setter TargetName="bd" Property="Background">
+                      <Setter.Value>
+                        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                          <GradientStop Color="#FF0B0B0B" Offset="0" />
+                          <GradientStop Color="#FF181818" Offset="1" />
+                        </LinearGradientBrush>
+                      </Setter.Value>
+                    </Setter>
+                  </Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </ToggleButton.Template>
+          </ToggleButton>
           <TextBlock x:Name="SearchCount" Foreground="#FF999999" Margin="8,0,0,0" VerticalAlignment="Center" FontSize="12" />
           <Button Content="✕" Click="SearchClose_Click" Margin="8,0,0,0" Background="Transparent" Foreground="#FF999999" BorderThickness="0" />
         </StackPanel>

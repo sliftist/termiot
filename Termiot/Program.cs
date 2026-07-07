@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Windows;
 
 namespace Termiot;
@@ -20,6 +21,10 @@ public static class Program
         {
             AppLog.InstallCrashHandlers(null);
             return SelfTest.Run();
+        }
+        if (args.Length >= 1 && args[0] == "--profile-vt")
+        {
+            return ProfileVt(args);
         }
         if (args.Contains("-Embedding") || args.Contains("/Embedding"))
         {
@@ -182,7 +187,7 @@ public static class Program
             }
             if (!windowAlive)
             {
-                KillShellHost(existingShellId);
+                HostInfo.Kill(existingShellId);
             }
         }
         if (LastActiveWindow.LoadAlive(windowId) is { } record && LastActiveWindow.SendEnsureShell(record, existingShellId))
@@ -216,25 +221,95 @@ public static class Program
         return state.Shells.Count;
     }
 
-    private static void KillShellHost(string shellId)
+    // Measures pure VtParser throughput against real recorded logs (fed in 64 KB chunks, like replay). Results go to stdout and %TEMP%\termiot-vt-profile.txt.
+    private static int ProfileVt(string[] args)
     {
+        var sb = new StringBuilder();
+        void Log(string s) => sb.AppendLine(s);
+
+        List<string> files;
+        if (args.Length >= 2 && File.Exists(args[1]))
+        {
+            files = new List<string> { args[1] };
+        }
+        else
+        {
+            files = Directory.GetFiles(AppPaths.ShellsDir, "output*.log", SearchOption.AllDirectories)
+                .OrderByDescending(f => new FileInfo(f).Length)
+                .Take(6)
+                .ToList();
+        }
+
+        Log($"VT parser profile — {Environment.ProcessorCount} logical cores, .NET {Environment.Version}");
+        Log("");
+        Log($"{"log",-40}{"size",10}{"cold",10}{"best",10}{"MB/s",10}");
+
+        long totalBytes = 0;
+        double totalBestMs = 0;
+        foreach (var file in files)
+        {
+            byte[] data;
+            try
+            {
+                data = File.ReadAllBytes(file);
+            }
+            catch (Exception ex)
+            {
+                Log($"skip {file}: {ex.Message}");
+                continue;
+            }
+            if (data.Length == 0)
+            {
+                continue;
+            }
+
+            double cold = RunOnce(data); // first pass: cold JIT + GC growth, like the app's one-and-only parse
+            const int runs = 5;
+            double best = double.MaxValue;
+            for (int i = 0; i < runs; i++)
+            {
+                best = Math.Min(best, RunOnce(data));
+            }
+            double mb = data.Length / (1024.0 * 1024.0);
+            string name = Path.GetFileName(Path.GetDirectoryName(file)) + "/" + Path.GetFileName(file);
+            Log($"{name,-40}{mb,9:0.00}M{cold,9:0.0}ms{best,9:0.0}ms{mb / (best / 1000.0),10:0.0}");
+            totalBytes += data.Length;
+            totalBestMs += best;
+        }
+
+        double totalMb = totalBytes / (1024.0 * 1024.0);
+        double mbPerSec = totalMb / (totalBestMs / 1000.0);
+        Log("");
+        Log($"total: {totalMb:0.00} MB in {totalBestMs:0.0} ms = {mbPerSec:0.0} MB/s ({1000.0 / mbPerSec:0.00} ms per MB)");
+        Log($"→ a 100 KB tail replay ≈ {100.0 / 1024.0 / mbPerSec * 1000.0:0.00} ms of parsing");
+        Log($"→ a full 10 MB log ≈ {10.0 / mbPerSec * 1000.0:0.0} ms of parsing");
+
+        var text = sb.ToString();
+        var outPath = Path.Combine(Path.GetTempPath(), "termiot-vt-profile.txt");
         try
         {
-            var path = AppPaths.HostInfoFile(shellId);
-            if (!File.Exists(path))
-            {
-                return;
-            }
-            var host = System.Text.Json.JsonSerializer.Deserialize<HostInfo>(File.ReadAllText(path));
-            if (host != null && HostInfo.ProcessAlive(host.Pid, host.StartTicks))
-            {
-                Process.GetProcessById(host.Pid).Kill();
-            }
+            File.WriteAllText(outPath, text);
         }
-        catch (Exception ex)
+        catch
         {
-            AppLog.Write("ui", $"ensure: shell host kill failed for {shellId}: {ex.Message}");
         }
+        Console.Write(text);
+        return 0;
+    }
+
+    // One pass: fresh screen + parser, fed in replay-sized chunks. Returns milliseconds.
+    private static double RunOnce(byte[] data)
+    {
+        var screen = new Terminal.TermScreen(120, 30) { ScrollbackCap = 1_000_000 };
+        var parser = new Terminal.VtParser(screen);
+        const int chunk = 64 * 1024;
+        var sw = Stopwatch.StartNew();
+        for (int off = 0; off < data.Length; off += chunk)
+        {
+            parser.Feed(data, off, Math.Min(chunk, data.Length - off));
+        }
+        sw.Stop();
+        return sw.Elapsed.TotalMilliseconds;
     }
 
     public readonly record struct LaunchPlan(string WindowId, bool ForceResume, bool TakeFocus);

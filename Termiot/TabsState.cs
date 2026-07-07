@@ -14,6 +14,10 @@ public sealed class TabInfo
     public string PendingInput { get; set; } = "";
     // Sort key from --ensure --order: keeps scripted tabs in a consistent position; the highest-order tab wins focus. 0 = unordered (sorts first).
     public int EnsureOrder { get; set; }
+    // When the watching window saw the shell process die; 0 while running (or if it died unwatched). Compared against the window's close time to decide whether a dead shell was part of the working set worth restoring.
+    public long ExitedAtTicks { get; set; }
+    // Sticky preference: this shell's host should be spawned elevated (prompts UAC). The renderer stays unelevated.
+    public bool Elevated { get; set; }
 }
 
 // Per-shell metadata stored inside the shell's own folder (shells\<id>\shell.json), written by the window that watches it.
@@ -25,6 +29,8 @@ public sealed class ShellInfo
     public string ForcedTitle { get; set; } = "";
     public string PendingInput { get; set; } = "";
     public int EnsureOrder { get; set; }
+    public long ExitedAtTicks { get; set; }
+    public bool Elevated { get; set; }
 
     public static ShellInfo? Load(string shellId)
     {
@@ -48,7 +54,7 @@ public sealed class ShellInfo
         try
         {
             Directory.CreateDirectory(AppPaths.ShellDir(info.Id));
-            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder }, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated }, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(AppPaths.ShellInfoFile(info.Id), json);
         }
         catch (Exception ex)
@@ -112,6 +118,29 @@ public sealed class HostInfo
             return false;
         }
     }
+
+    // Forcefully and immediately kill the shell host (and its ConPTY/shell children) by the recorded pid — no graceful pipe message that a busy host could block on. Thread-safe and non-blocking; the log is append-on-write, so a kill loses at most the last unflushed instant of scrollback, same as any crash.
+    public static void Kill(string shellId)
+    {
+        try
+        {
+            var path = AppPaths.HostInfoFile(shellId);
+            if (!File.Exists(path))
+            {
+                return;
+            }
+            var info = JsonSerializer.Deserialize<HostInfo>(File.ReadAllText(path));
+            if (info != null && ProcessAlive(info.Pid, info.StartTicks))
+            {
+                using var p = Process.GetProcessById(info.Pid);
+                p.Kill(entireProcessTree: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLog.Write("state", $"host kill failed for {shellId}: {ex.Message}");
+        }
+    }
 }
 
 // windows\<id>.json — the window process's own state: which shells it renders, in order, where the window is on screen, and which process currently owns it (pid + start time, same liveness scheme as shells — no lock handles are ever held).
@@ -130,6 +159,7 @@ public sealed class WindowState
     public long OwnerStartTicks { get; set; }
     // True only when the user deliberately closed the window (X button). Crashes never write it, and session-ending (shutdown/logoff) closes deliberately leave it false — both cases reopen on the next launch.
     public bool ClosedCleanly { get; set; }
+    // Stamped on any window close (clean or session-ending); 0 while running or after a crash. Paired with each shell's ExitedAtTicks to tell dead tabs the user had abandoned apart from shells that died with the window.
     public long ClosedAtTicks { get; set; }
 
     public static WindowState Load(string windowId)
@@ -172,9 +202,13 @@ public sealed class WindowState
         }
     }
 
+    // A shell that died more than this long before the window closed was a dead tab the user had abandoned, not part of the working set — anything newer (or that died after the close, or was never seen dying) was plausibly alive when the window went away.
+    public const int ExitNearCloseGraceSeconds = 60;
+
     public List<TabInfo> LoadTabs()
     {
         var tabs = new List<TabInfo>();
+        long exitCutoff = ClosedAtTicks > 0 ? ClosedAtTicks - TimeSpan.FromSeconds(ExitNearCloseGraceSeconds).Ticks : 0;
         foreach (var id in Shells)
         {
             if (!Directory.Exists(AppPaths.ShellDir(id)))
@@ -182,7 +216,11 @@ public sealed class WindowState
                 continue;
             }
             var info = ShellInfo.Load(id) ?? new ShellInfo();
-            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder });
+            if (exitCutoff > 0 && info.ExitedAtTicks != 0 && info.ExitedAtTicks < exitCutoff && !HostInfo.IsShellAlive(id))
+            {
+                continue;
+            }
+            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated });
         }
         return tabs;
     }
