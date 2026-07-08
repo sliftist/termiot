@@ -6,7 +6,7 @@ A durable terminal for windows. Remembers your tab state during reboot. Isolates
 
 Uses WPF. Reasonable fast and lightweight.
 
-MIT licensed. Fork it and fix it yourself. Stop wasting your time with terminals that refuse to add basic features and make your own.
+MIT licensed. Fork it and fix it yourself. Stop wasting your time with terminals that refuse to add basic features - add them yourself.
 
 Bug reports are welcome, feature requests are welcome. Pull requests are unlikely to be merged. This is a personal project to make a terminal that only supports features I want. If you want a feature, clone it and tell Claude to add the feature. There's 90% chance it will be able to 1 shot it.
 
