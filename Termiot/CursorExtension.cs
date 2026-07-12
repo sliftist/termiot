@@ -48,7 +48,9 @@ public static class CursorExtension
                     const folder = editorPath
                         ? vscode.workspace.getWorkspaceFolder(vscode.Uri.file(editorPath))?.uri?.fsPath
                         : undefined;
-                    const dir = folder ?? vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath ?? os.homedir();
+                    let dir = folder ?? vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath ?? os.homedir();
+                    // VS Code's Uri.fsPath lowercases the Windows drive letter; restore it so the path keeps its real casing.
+                    dir = dir.replace(/^([a-z]):/, (m, d) => d.toUpperCase() + ':');
                     const req = http.get('http://127.0.0.1:{{HttpOpenHost.Port}}/open?dir=' + encodeURIComponent(dir), () => {});
                     req.on('error', () => {
                         try {

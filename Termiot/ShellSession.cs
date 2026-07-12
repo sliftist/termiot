@@ -298,6 +298,11 @@ public sealed class ShellSession : IDisposable
                 var scratch = new TermScreen(cols, rows) { ScrollbackCap = _screen.ScrollbackCap };
                 var parser = new VtParser(scratch) { ShowEscapes = _parser.ShowEscapes };
                 parser.Feed(bytes, 0, bytes.Length);
+                // win32-input-mode is enabled once at startup, so on resume its ?9001h lives only in this old history — recover it, unless the live tail already established the mode (a later toggle there wins).
+                if (parser.SawWin32Toggle && !_parser.SawWin32Toggle)
+                {
+                    _parser.OnWin32InputMode?.Invoke(parser.Win32InputMode);
+                }
                 double feedMs = sw.Elapsed.TotalMilliseconds;
                 sw.Restart();
                 var lines = scratch.SnapshotLines();

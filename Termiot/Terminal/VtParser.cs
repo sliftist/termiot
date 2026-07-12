@@ -29,6 +29,9 @@ public sealed class VtParser
     public Action<string>? OnCommandMarker;
     // ConPTY requests win32-input-mode (?9001) at session start; when granted, keyboard input is sent as full Win32 key records so modifier distinctions (Ctrl+Enter vs Enter) survive.
     public Action<bool>? OnWin32InputMode;
+    // Final win32-input-mode state this parser has seen, and whether it saw any ?9001 toggle at all. Used to recover the mode from old scrollback on resume, where the enabling sequence (sent once at startup) is no longer in the live tail.
+    public bool Win32InputMode { get; private set; }
+    public bool SawWin32Toggle { get; private set; }
 
     private const string CommandMarkerPrefix = "termiot-cmd:";
 
@@ -486,6 +489,8 @@ public sealed class VtParser
                 _s.CursorVisible = on;
                 break;
             case 9001:
+                Win32InputMode = on;
+                SawWin32Toggle = true;
                 OnWin32InputMode?.Invoke(on);
                 break;
             case 47:

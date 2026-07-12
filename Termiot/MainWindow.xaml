@@ -11,12 +11,21 @@
       <Grid>
         <StackPanel x:Name="TabBarRows">
           <DockPanel x:Name="TopRowDock">
-            <Button x:Name="ReloadBtn" DockPanel.Dock="Right" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones). Shift+Click: reload onto the newest existing build without rebuilding." />
-            <Button x:Name="SettingsBtn" DockPanel.Dock="Right" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
-            <TextBlock x:Name="BuildTimeText" DockPanel.Dock="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
-            <!-- Fixed width + right alignment: the readout changes every second, so a content-sized box would reflow the window name and tab strip on each tick. -->
-            <TextBlock x:Name="FpsText" DockPanel.Dock="Right" Width="170" TextAlignment="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0,0,0" ToolTip="Painted frames last second (output-driven; idle is 0) · average cost of one full render · the fps that cost could sustain" />
-            <TextBox x:Name="WindowNameBox" DockPanel.Dock="Right" MinWidth="50" VerticalAlignment="Center" Margin="6,0,0,0" Background="Transparent" Foreground="#FF9A9AC8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontSize="11" TextChanged="WindowNameBox_TextChanged" ToolTip="Window name — targetable from launches via --ensure --window &lt;name&gt;" />
+            <!-- The window chrome (name, readouts, settings/reload) shares a slightly darker panel so its bounds are visible against the tab strip. -->
+            <Border x:Name="ChromePanel" DockPanel.Dock="Right" Background="#FF0D0D0D" MouseEnter="ChromePanel_MouseEnter" MouseLeave="ChromePanel_MouseLeave">
+              <StackPanel Orientation="Horizontal">
+                <!-- Reserves no width until the window is named; a faint "name" hint appears only on chrome hover or focus, so an unnamed window shows no blank gap. -->
+                <Grid VerticalAlignment="Center">
+                  <TextBlock x:Name="WindowNamePlaceholder" Text="name" Foreground="#FF5A5A5A" FontSize="11" VerticalAlignment="Center" Margin="8,0,0,0" IsHitTestVisible="False" Visibility="Collapsed" />
+                  <TextBox x:Name="WindowNameBox" MinWidth="0" HorizontalAlignment="Stretch" VerticalAlignment="Center" Margin="6,0,0,0" Background="Transparent" Foreground="#FF9A9AC8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontSize="11" TextChanged="WindowNameBox_TextChanged" GotKeyboardFocus="WindowNameBox_FocusChanged" LostKeyboardFocus="WindowNameBox_FocusChanged" ToolTip="Window name — targetable from launches via --ensure --window &lt;name&gt;" />
+                </Grid>
+                <!-- Fixed width + right alignment: the readout changes every second, so a content-sized box would reflow the window name and tab strip on each tick. -->
+                <TextBlock x:Name="FpsText" Width="90" TextAlignment="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0,0,0" ToolTip="Painted frames last second (output-driven; idle is 0) · average cost of one full render · the fps that cost could sustain" />
+                <TextBlock x:Name="BuildTimeText" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
+                <Button x:Name="SettingsBtn" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
+                <Button x:Name="ReloadBtn" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones). Shift+Click: reload onto the newest existing build without rebuilding." />
+              </StackPanel>
+            </Border>
             <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" Visibility="Collapsed" />
             <Button x:Name="ScrollRightBtn" DockPanel.Dock="Right" Content="▶" Click="ScrollRightBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
             <Button x:Name="ScrollLeftBtn" DockPanel.Dock="Left" Content="◀" Click="ScrollLeftBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />

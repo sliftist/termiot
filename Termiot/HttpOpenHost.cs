@@ -71,6 +71,12 @@ public static class HttpOpenHost
         }
     }
 
+    // Cursor/VS Code's Uri.fsPath lowercases the Windows drive letter; restore it so the shell's cwd matches the real path casing.
+    private static string NormalizeDrive(string path)
+    {
+        return path.Length >= 2 && path[1] == ':' && char.IsLower(path[0]) ? char.ToUpperInvariant(path[0]) + path[1..] : path;
+    }
+
     private static void HandleClient(TcpClient client, Action<string> openLocally)
     {
         client.ReceiveTimeout = 2000;
@@ -81,7 +87,7 @@ public static class HttpOpenHost
         bool ok = false;
         if (parts.Length >= 2 && parts[0] == "GET" && parts[1].StartsWith("/open?dir=", StringComparison.Ordinal))
         {
-            var dir = WebUtility.UrlDecode(parts[1]["/open?dir=".Length..]);
+            var dir = NormalizeDrive(WebUtility.UrlDecode(parts[1]["/open?dir=".Length..]));
             if (Directory.Exists(dir))
             {
                 AppLog.Write("ui", "open-http request for " + dir);

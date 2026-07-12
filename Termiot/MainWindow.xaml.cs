@@ -49,6 +49,10 @@ public partial class MainWindow : Window
         public string PendingInput = "";
         public string LastCommand = "";
         public CommandHistory History = null!;
+        // Raw-keys mode has no input box, so the current line is reconstructed from keystrokes to feed history: printable text accumulates, Backspace pops, plain Enter commits. Tainted (paste, navigation/edit keys, or over the keystroke cap) → the line is not stored.
+        public readonly System.Text.StringBuilder RawHistoryLine = new();
+        public int RawHistoryKeys;
+        public bool RawHistoryTainted;
         public bool Running;
         // (command, absolute line index) pairs from termiot-cmd markers; guarded by Screen.Sync (appended during parsing, read for LLM context).
         public List<(string Cmd, int Line)> CommandMarks = new();
@@ -69,6 +73,11 @@ public partial class MainWindow : Window
         public TextBlock AdminBadge = null!;
         public StackPanel ResourceRow = null!;
         public double StickyHeaderWidth;
+        // Width stickiness: when the header last recompacted and how many recompactions landed in quick succession — enough rapid ones pin the width to StickyPinWidth until StickyPinnedUntilTicks, so a title whose width keeps jumping stops reflowing the rows.
+        public long StickyLastRecompactTicks;
+        public int StickyRapidChanges;
+        public double StickyPinWidth;
+        public long StickyPinnedUntilTicks;
         // Index order: VRAM, CPU, memory.
         public TextBlock[] ResourceTexts = null!;
         public System.Windows.Shapes.Rectangle[] ResourceBars = null!;
@@ -85,6 +94,8 @@ public partial class MainWindow : Window
     private List<(int Line, int Col)> _matches = new();
     private int _matchIndex = -1;
     private const int YarnNamesCacheMs = 5000;
+    // Regular candidates are recomputed at most this often after typing stops, off the UI thread, so directory enumeration never blocks keystrokes.
+    private const int CandDebounceMs = 50;
 
     private string _yarnNamesCwd = "";
     private long _yarnNamesTick;
@@ -92,6 +103,12 @@ public partial class MainWindow : Window
     private readonly LlmPredictor _predictor;
     private readonly ResourceSampler _resources = new();
     private readonly DispatcherTimer _llmTimer;
+    private readonly DispatcherTimer _candTimer;
+    // Bumped on every regular-candidate recompute; a background result whose generation is stale (or whose input has changed) is discarded.
+    private int _candComputeGen;
+    // The input text _candidates was computed for — lets Tab tell whether the async result is stale and recompute synchronously.
+    private string _candText = "";
+    private readonly object _yarnLock = new();
     private readonly List<TextBlock> _suggestionRows = new();
     // The unified suggestion list shown under the input: LLM predictions when the LLM toggle is on, otherwise the regular candidates (history, yarn, filesystem). Tab walks _candIndex through the whole list; _candWindowStart is the rolling display window.
     private List<string> _candidates = new();
@@ -229,6 +246,12 @@ public partial class MainWindow : Window
             _llmTimer.Stop();
             RequestLlmPrediction();
         };
+        _candTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(CandDebounceMs) };
+        _candTimer.Tick += (_, _) =>
+        {
+            _candTimer.Stop();
+            ComputeRegularCandidatesAsync();
+        };
         BuildTimeText.Text = BuildInfo.Display;
         ReloadBtn.Visibility = BuildInfo.HasSource ? Visibility.Visible : Visibility.Collapsed;
         WindowNameBox.Text = state.Name;
@@ -243,6 +266,11 @@ public partial class MainWindow : Window
             }
             UpdateResourceRows();
             UpdateScrollStats();
+            long nowTicks = Environment.TickCount64;
+            if (_tabs.Any(t => t.StickyPinnedUntilTicks != 0 && nowTicks >= t.StickyPinnedUntilTicks))
+            {
+                RelayoutTabRows();
+            }
         };
         statsTimer.Start();
         LlmToggle.IsChecked = _settings.LlmEnabled;
@@ -485,7 +513,7 @@ public partial class MainWindow : Window
     {
         var screen = new TermScreen(120, 30) { ScrollbackCap = _settings.ScrollbackLines };
         var parser = new VtParser(screen) { ShowEscapes = _settings.ShowEscapeSequences };
-        var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput, History = new CommandHistory(AppPaths.ShellHistoryFile(info.Id)) };
+        var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput, Win32Input = info.Win32Input, History = new CommandHistory(AppPaths.ShellHistoryFile(info.Id)) };
         // Just record the latest title; the render tick applies it (see RenderDirtyTabs). Dispatching per sequence floods the UI thread — a heavy replay carries thousands of title changes.
         parser.OnTitle = title =>
         {
@@ -499,6 +527,11 @@ public partial class MainWindow : Window
             vm.Win32Input = on;
             Dispatcher.BeginInvoke(() =>
             {
+                if (vm.Info.Win32Input != on)
+                {
+                    vm.Info.Win32Input = on;
+                    ScheduleSave();
+                }
                 RefreshTabTitle(vm);
                 if (vm == Active)
                 {
@@ -563,6 +596,14 @@ public partial class MainWindow : Window
             {
                 vm.CommandMarks[i] = (vm.CommandMarks[i].Cmd, vm.CommandMarks[i].Line + delta);
             }
+            // Prepending shifts every line's index down by delta; keep a scrolled-up view of the active tab on the same content.
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (vm == Active)
+                {
+                    Term.ShiftScrollAnchor(delta);
+                }
+            });
         };
         // Once the focused tab's older history is loaded, wait, then load the rest — so background tabs never compete with the initial load.
         session.ScrollbackLoaded += () => Dispatcher.BeginInvoke(() =>
@@ -700,10 +741,33 @@ public partial class MainWindow : Window
     // --ensure targeting: make the named shell run (fresh command via its AUTORESUME.cmd). If it's already running, this is a takeover — the old process dies first.
     private void WindowNameBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
+        UpdateWindowNamePlaceholder();
         if (_uiReady)
         {
             ScheduleSave();
         }
+    }
+
+    private bool _chromeHover;
+    private void ChromePanel_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
+    {
+        _chromeHover = true;
+        UpdateWindowNamePlaceholder();
+    }
+    private void ChromePanel_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
+    {
+        _chromeHover = false;
+        UpdateWindowNamePlaceholder();
+    }
+    private void WindowNameBox_FocusChanged(object sender, System.Windows.Input.KeyboardFocusChangedEventArgs e)
+    {
+        UpdateWindowNamePlaceholder();
+    }
+    // The window-name field collapses to nothing until named; the "name" hint (and thus a click target) is only shown while hovering the chrome or editing the field.
+    private void UpdateWindowNamePlaceholder()
+    {
+        bool empty = string.IsNullOrEmpty(WindowNameBox.Text);
+        WindowNamePlaceholder.Visibility = empty && (_chromeHover || WindowNameBox.IsKeyboardFocused) ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void EnsureShellRuns(string shellId)
@@ -1395,14 +1459,95 @@ public partial class MainWindow : Window
     }
 
     // Multi-row tab strip. Row 0 shares the top bar with the window controls; further full-width rows are created on demand — as many as the tabs need, nothing scrolls.
-    private const double StickyHeaderShrinkPx = 30;
+    // A header may sit up to this many px wider than its content before it recompacts — absorbs small title fluctuations without reflowing the rows.
+    private const double StickyHeaderSlackPx = 30;
+    // Recompactions closer together than this count as rapid; StickyPinThreshold of them pins the header to its recent-larger width for StickyPinDurationMs so a jittery title stops thrashing the layout.
+    private const long StickyRapidWindowMs = 2500;
+    private const int StickyPinThreshold = 5;
+    private const long StickyPinDurationMs = 20_000;
     // Long enough for a paste-detection window to close, short enough to feel instant.
     private const int Win32EnterDelayMs = 50;
     private readonly List<StackPanel> _extraRowPanels = new();
     private Button _inlinePlus = null!;
 
+    // Measure one header's natural width and fold it through the sticky/pin logic into vm.StickyHeaderWidth. Called while the header is still attached to the tree so Measure actually re-runs; the title width also comes from a direct FormattedText measurement because a TextBlock hands back a stale width after its text shrinks.
+    private void ComputeHeaderWidth(TabVm vm, long nowTicks)
+    {
+        var header = vm.Header;
+        var titleBlock = vm.HeaderText;
+        string titleStr = new System.Windows.Documents.TextRange(titleBlock.ContentStart, titleBlock.ContentEnd).Text;
+        double titleW = 0;
+        if (titleStr.Length > 0)
+        {
+            var typeface = new Typeface(titleBlock.FontFamily, titleBlock.FontStyle, titleBlock.FontWeight, titleBlock.FontStretch);
+            var ft = new FormattedText(titleStr, System.Globalization.CultureInfo.CurrentUICulture, titleBlock.FlowDirection, typeface, titleBlock.FontSize, Brushes.Black, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+            titleW = Math.Ceiling(Math.Min(titleBlock.MaxWidth, ft.WidthIncludingTrailingWhitespace));
+        }
+        titleBlock.Width = titleW;
+        header.MinWidth = 0;
+        header.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
+        double natural = Math.Ceiling(header.DesiredSize.Width);
+        // Width stickiness: grow to fit immediately, and stay compact — hold at most StickyHeaderSlackPx of extra width so tiny title changes don't reflow, but recompact once the content shrinks past that. A title whose width keeps jumping gets pinned to its recent-larger width so it stops thrashing the rows.
+        if (vm.StickyPinnedUntilTicks != 0 && nowTicks >= vm.StickyPinnedUntilTicks)
+        {
+            vm.StickyPinnedUntilTicks = 0;
+            vm.StickyRapidChanges = 0;
+        }
+        double width;
+        if (vm.StickyPinnedUntilTicks != 0)
+        {
+            // Pinned: hold the larger width, re-arming while the content keeps growing.
+            if (natural > vm.StickyPinWidth)
+            {
+                vm.StickyPinWidth = natural;
+                vm.StickyPinnedUntilTicks = nowTicks + StickyPinDurationMs;
+            }
+            width = vm.StickyPinWidth;
+        }
+        else if (natural >= vm.StickyHeaderWidth)
+        {
+            width = natural;
+        }
+        else if (vm.StickyHeaderWidth - natural > StickyHeaderSlackPx)
+        {
+            // Shrank past the slack — recompact, and watch for a jittery title that recompacts over and over.
+            vm.StickyRapidChanges = nowTicks - vm.StickyLastRecompactTicks < StickyRapidWindowMs ? vm.StickyRapidChanges + 1 : 1;
+            vm.StickyLastRecompactTicks = nowTicks;
+            if (vm.StickyRapidChanges >= StickyPinThreshold)
+            {
+                vm.StickyPinWidth = vm.StickyHeaderWidth;
+                vm.StickyPinnedUntilTicks = nowTicks + StickyPinDurationMs;
+                vm.StickyRapidChanges = 0;
+                width = vm.StickyPinWidth;
+            }
+            else
+            {
+                width = natural;
+            }
+        }
+        else
+        {
+            width = vm.StickyHeaderWidth;
+        }
+        vm.StickyHeaderWidth = width;
+        header.MinWidth = width;
+        if (width > 220)
+        {
+            PerfLog.Record($"tab-size {vm.Info.Id}: nat={natural:0} w={width:0} titleW={titleW:0} attached={(VisualTreeHelper.GetParent(header) != null ? 1 : 0)}");
+        }
+    }
+
     private void RelayoutTabRows()
     {
+        // Measure header widths while they are still attached from the last layout. A detached element never re-runs Measure — it hands back the last arranged width — so measuring after the panels are cleared returns stale sizes and tabs never shrink.
+        if (!_settings.SingleRowTabs)
+        {
+            long measureTicks = Environment.TickCount64;
+            foreach (var vm in _tabs)
+            {
+                ComputeHeaderWidth(vm, measureTicks);
+            }
+        }
         TabStrip.Children.Clear();
         foreach (var panel in _extraRowPanels)
         {
@@ -1424,6 +1569,7 @@ public partial class MainWindow : Window
             foreach (var vm in _tabs)
             {
                 vm.Header.MinWidth = 0;
+                vm.HeaderText.Width = double.NaN;
                 TabStrip.Children.Add(vm.Header);
             }
             TabStrip.Children.Add(_inlinePlus);
@@ -1451,16 +1597,7 @@ public partial class MainWindow : Window
         foreach (var vm in _tabs)
         {
             var header = vm.Header;
-            header.MinWidth = 0;
-            header.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-            double natural = header.DesiredSize.Width;
-            // Width stickiness: titles change constantly (command names come and go), so a header that shrinks a little keeps its previous width as padding instead of reflowing the rows. Growth, or a shrink beyond the threshold, re-anchors.
-            if (natural >= vm.StickyHeaderWidth || vm.StickyHeaderWidth - natural > StickyHeaderShrinkPx)
-            {
-                vm.StickyHeaderWidth = natural;
-            }
             double width = vm.StickyHeaderWidth;
-            header.MinWidth = width;
             if (used + width > CapacityFor(row) && PanelFor(row).Children.Count > 0)
             {
                 row++;
@@ -1506,10 +1643,16 @@ public partial class MainWindow : Window
         {
             return;
         }
+        // Remember the outgoing tab's scroll position so switching back restores it instead of jumping.
+        if (Active is { } outgoing)
+        {
+            outgoing.Info.ScrollFromBottom = Term.ScrollFromBottom;
+        }
         _active = index;
         var vm = _tabs[index];
         Term.ShowTermCursor = RawMode && !vm.Dead && vm.Session != null;
         Term.Attach(vm.Screen);
+        Term.SetScrollFromBottom(vm.Info.ScrollFromBottom);
         // Switching to a tab loads its older history now rather than waiting for the delayed pass (its recent tail is already on screen from the file read).
         vm.Session?.Activate();
         CwdLabel.Text = vm.Info.Cwd;
@@ -1991,6 +2134,11 @@ public partial class MainWindow : Window
 
     private void SaveState(bool closedCleanly = false, bool closing = false)
     {
+        // The active tab's live scroll position lives on the shared control; capture it before persisting.
+        if (Active is { } activeTab)
+        {
+            activeTab.Info.ScrollFromBottom = Term.ScrollFromBottom;
+        }
         foreach (var tab in _tabs)
         {
             if (tab.Info.PendingInput != tab.PendingInput)
@@ -2153,6 +2301,8 @@ public partial class MainWindow : Window
                         }
                         LogRawKeystroke(text);
                         Term.ScrollToBottom();
+                        // Pasted content isn't "typed" — don't let it end up in history.
+                        pasteVm.RawHistoryTainted = true;
                     }
                 }
                 catch (Exception ex)
@@ -2285,7 +2435,9 @@ public partial class MainWindow : Window
         }
         else
         {
-            _candidates = BuildTabCandidates(InputBox.Text);
+            // Regular candidates hit the filesystem — recompute debounced and off-thread so typing never blocks on directory enumeration.
+            _candTimer.Stop();
+            _candTimer.Start();
         }
         UpdateLlmUi();
     }
@@ -2475,9 +2627,11 @@ public partial class MainWindow : Window
     // Tab / Down move forward through the suggestion list, Shift+Tab / Up move back; the visible window of rows rolls along with the selection, and one step past the ends restores what the user had typed.
     private void CycleCandidates(bool backwards)
     {
-        if (_candidates.Count == 0 && !UseLlmFor(InputBox.Text))
+        if (!UseLlmFor(InputBox.Text) && (_candidates.Count == 0 || _candText != InputBox.Text))
         {
+            // The background result may not have landed (or is for older input) — compute synchronously for this deliberate Tab press.
             _candidates = BuildTabCandidates(InputBox.Text);
+            _candText = InputBox.Text;
             _candWindowStart = 0;
         }
         if (_candidates.Count == 0)
@@ -2683,20 +2837,92 @@ public partial class MainWindow : Window
         return (messages, display);
     }
 
-    // Regular (non-LLM) candidates: history commands matching the whole input first, then yarn scripts when applicable, then entries of the current directory whose name starts with the last space-separated token.
+    // Debounced, off-thread recompute of the regular candidates: history (in-memory) is gathered on the UI thread, the filesystem/yarn work runs on a background thread, and the merged result is applied only if the input hasn't changed since — so keystrokes never wait on directory enumeration.
+    private void ComputeRegularCandidatesAsync()
+    {
+        string text = InputBox.Text;
+        if (UseLlmFor(text))
+        {
+            return;
+        }
+        var history = text.Length > 0 && Active is { } vm ? HistoryCandidates(text, vm) : new List<string>();
+        string cwd = Active?.Info.Cwd ?? "";
+        int gen = ++_candComputeGen;
+        Task.Run(() =>
+        {
+            List<string> fs;
+            try
+            {
+                fs = FsAndYarnCandidates(text, cwd);
+            }
+            catch
+            {
+                fs = new List<string>();
+            }
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (gen != _candComputeGen || InputBox.Text != text || UseLlmFor(text))
+                {
+                    return;
+                }
+                _candidates = CombineCandidates(history, fs);
+                _candText = text;
+                _candWindowStart = 0;
+                UpdateLlmUi();
+            });
+        });
+    }
+
+    // Regular (non-LLM) candidates: history commands matching the whole input first, then yarn scripts when applicable, then entries of the current directory whose name starts with the last space-separated token. Synchronous — used as the Tab fallback when the async result isn't ready.
     private List<string> BuildTabCandidates(string text)
+    {
+        var history = text.Length > 0 && Active is { } vm ? HistoryCandidates(text, vm) : new List<string>();
+        return CombineCandidates(history, FsAndYarnCandidates(text, Active?.Info.Cwd ?? ""));
+    }
+
+    private static List<string> CombineCandidates(List<string> history, List<string> fs)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        foreach (var h in history)
+        {
+            if (seen.Add(h))
+            {
+                result.Add(h);
+            }
+        }
+        foreach (var f in fs)
+        {
+            if (seen.Add(f))
+            {
+                result.Add(f);
+            }
+        }
+        return result;
+    }
+
+    private static List<string> HistoryCandidates(string text, TabVm vm)
     {
         var result = new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (text.Length > 0 && Active is { } activeVm)
+        foreach (var entry in vm.History.Match(text))
         {
-            foreach (var entry in activeVm.History.Match(text))
+            if (!string.Equals(entry, text, StringComparison.OrdinalIgnoreCase) && seen.Add(entry))
             {
-                if (!string.Equals(entry, text, StringComparison.OrdinalIgnoreCase) && seen.Add(entry))
-                {
-                    result.Add(entry);
-                }
+                result.Add(entry);
             }
+        }
+        return result;
+    }
+
+    // The slow part (directory enumeration, package.json / node_modules\.bin reads). Pure over (text, cwd) so it runs safely on a background thread.
+    private List<string> FsAndYarnCandidates(string text, string cwd)
+    {
+        var result = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (cwd.Length == 0 || text.Length == 0)
+        {
+            return result;
         }
         int lastSpace = text.LastIndexOf(' ');
         string head = lastSpace >= 0 ? text[..(lastSpace + 1)] : "";
@@ -2704,33 +2930,28 @@ public partial class MainWindow : Window
         int sepIndex = token.LastIndexOfAny(new[] { '\\', '/' });
         string dirPart = sepIndex >= 0 ? token[..(sepIndex + 1)] : "";
         string prefix = token[(sepIndex + 1)..];
-        string cwd = Active?.Info.Cwd ?? "";
-        if (cwd.Length > 0 && head.Trim().Equals("yarn", StringComparison.OrdinalIgnoreCase))
+        if (head.Trim().Equals("yarn", StringComparison.OrdinalIgnoreCase))
         {
             AddYarnCandidates(head, token, cwd, result, seen);
         }
-        // Filesystem entries only once something is typed — an empty input suggests pure command history — and they always rank below history and yarn candidates.
-        if (cwd.Length > 0 && text.Length > 0)
+        try
         {
-            try
+            string dir = Path.IsPathRooted(dirPart) ? dirPart : Path.Combine(cwd, dirPart);
+            var names = Directory.GetFileSystemEntries(dir)
+                .Select(e => Path.GetFileName(e) + (Directory.Exists(e) ? "\\" : ""))
+                .Where(n => n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase);
+            foreach (var name in names)
             {
-                string dir = Path.IsPathRooted(dirPart) ? dirPart : Path.Combine(cwd, dirPart);
-                var names = Directory.GetFileSystemEntries(dir)
-                    .Select(e => Path.GetFileName(e) + (Directory.Exists(e) ? "\\" : ""))
-                    .Where(n => n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase);
-                foreach (var name in names)
+                var candidate = head + dirPart + name;
+                if (seen.Add(candidate))
                 {
-                    var candidate = head + dirPart + name;
-                    if (seen.Add(candidate))
-                    {
-                        result.Add(candidate);
-                    }
+                    result.Add(candidate);
                 }
             }
-            catch
-            {
-            }
+        }
+        catch
+        {
         }
         return result;
     }
@@ -2754,53 +2975,110 @@ public partial class MainWindow : Window
     // Cached briefly because this runs on every keystroke while recomputing candidates.
     private List<string> GetYarnNames(string cwd)
     {
-        if (cwd == _yarnNamesCwd && Environment.TickCount64 - _yarnNamesTick < YarnNamesCacheMs)
+        // Reached from the background candidate thread as well as the UI thread (Tab fallback); serialize cache access.
+        lock (_yarnLock)
         {
-            return _yarnNames;
-        }
-        var names = new List<string>();
-        try
-        {
-            var packagePath = Path.Combine(cwd, "package.json");
-            if (File.Exists(packagePath))
+            if (cwd == _yarnNamesCwd && Environment.TickCount64 - _yarnNamesTick < YarnNamesCacheMs)
             {
-                using var doc = JsonDocument.Parse(File.ReadAllText(packagePath));
-                if (doc.RootElement.TryGetProperty("scripts", out var scripts) && scripts.ValueKind == JsonValueKind.Object)
+                return _yarnNames;
+            }
+            var names = new List<string>();
+            try
+            {
+                var packagePath = Path.Combine(cwd, "package.json");
+                if (File.Exists(packagePath))
                 {
-                    foreach (var script in scripts.EnumerateObject())
+                    using var doc = JsonDocument.Parse(File.ReadAllText(packagePath));
+                    if (doc.RootElement.TryGetProperty("scripts", out var scripts) && scripts.ValueKind == JsonValueKind.Object)
                     {
-                        names.Add(script.Name);
+                        foreach (var script in scripts.EnumerateObject())
+                        {
+                            names.Add(script.Name);
+                        }
                     }
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            AppLog.Write("complete", "package.json parse failed: " + ex.Message);
-        }
-        try
-        {
-            var binDir = Path.Combine(cwd, "node_modules", ".bin");
-            if (Directory.Exists(binDir))
+            catch (Exception ex)
             {
-                names.AddRange(Directory.GetFiles(binDir)
-                    .Select(Path.GetFileNameWithoutExtension)
-                    .Where(n => !string.IsNullOrEmpty(n))
-                    .Select(n => n!)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase));
+                AppLog.Write("complete", "package.json parse failed: " + ex.Message);
             }
+            try
+            {
+                var binDir = Path.Combine(cwd, "node_modules", ".bin");
+                if (Directory.Exists(binDir))
+                {
+                    names.AddRange(Directory.GetFiles(binDir)
+                        .Select(Path.GetFileNameWithoutExtension)
+                        .Where(n => !string.IsNullOrEmpty(n))
+                        .Select(n => n!)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase));
+                }
+            }
+            catch
+            {
+            }
+            _yarnNamesCwd = cwd;
+            _yarnNamesTick = Environment.TickCount64;
+            _yarnNames = names;
+            return names;
         }
-        catch
-        {
-        }
-        _yarnNamesCwd = cwd;
-        _yarnNamesTick = Environment.TickCount64;
-        _yarnNames = names;
-        return names;
     }
 
     // --- raw keystroke mode ---
+
+    // A REPL line typed in raw mode is any run of plain typing ended by a plain Enter. We rebuild it from keystrokes so it can go into history; a keystroke count over this cap (a long message, or a program the user is driving rather than typing a command into) drops the line instead.
+    private const int MaxRawHistoryKeys = 200;
+
+    // Printable typed text; control characters mean editing we can't model linearly, so they taint the line.
+    private void RawHistoryText(TabVm vm, string text)
+    {
+        foreach (var ch in text)
+        {
+            if (ch < ' ' || ch == '\x7f')
+            {
+                vm.RawHistoryTainted = true;
+            }
+            else
+            {
+                vm.RawHistoryLine.Append(ch);
+            }
+            vm.RawHistoryKeys++;
+        }
+        if (vm.RawHistoryKeys > MaxRawHistoryKeys)
+        {
+            vm.RawHistoryTainted = true;
+        }
+    }
+
+    private void RawHistoryBackspace(TabVm vm)
+    {
+        if (vm.RawHistoryLine.Length > 0)
+        {
+            vm.RawHistoryLine.Length--;
+        }
+        vm.RawHistoryKeys++;
+    }
+
+    // Anything other than plain typing/backspace (arrows, Tab-completion, Ctrl chords, a modified Enter that inserts a newline) makes the reconstructed line unreliable.
+    private void RawHistoryTaint(TabVm vm)
+    {
+        vm.RawHistoryTainted = true;
+        vm.RawHistoryKeys++;
+    }
+
+    private void RawHistoryCommit(TabVm vm)
+    {
+        var line = vm.RawHistoryLine.ToString();
+        bool ok = !vm.RawHistoryTainted && vm.RawHistoryKeys <= MaxRawHistoryKeys && line.Trim().Length > 0;
+        vm.RawHistoryLine.Clear();
+        vm.RawHistoryKeys = 0;
+        vm.RawHistoryTainted = false;
+        if (ok)
+        {
+            vm.History.Add(line);
+        }
+    }
 
     private void Term_KeyDown(object sender, KeyEventArgs e)
     {
@@ -2816,6 +3094,19 @@ public partial class MainWindow : Window
             session.SendInput(encoded);
             LogRawKeystroke(System.Text.Encoding.UTF8.GetString(encoded));
             Term.ScrollToBottom();
+            bool noEditMods = (Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Shift)) == 0;
+            if (key == Key.Enter && noEditMods)
+            {
+                RawHistoryCommit(vm);
+            }
+            else if (key == Key.Back && (Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt)) == 0)
+            {
+                RawHistoryBackspace(vm);
+            }
+            else
+            {
+                RawHistoryTaint(vm);
+            }
         }
     }
 
@@ -2835,6 +3126,7 @@ public partial class MainWindow : Window
         }
         LogRawKeystroke(e.Text);
         Term.ScrollToBottom();
+        RawHistoryText(vm, e.Text);
         e.Handled = true;
     }
 

@@ -18,6 +18,10 @@ public sealed class TabInfo
     public long ExitedAtTicks { get; set; }
     // Sticky preference: this shell's host should be spawned elevated (prompts UAC). The renderer stays unelevated.
     public bool Elevated { get; set; }
+    // Persisted scroll position: -1 = pinned to the bottom (follows live output), else lines up from the bottom.
+    public int ScrollFromBottom { get; set; } = -1;
+    // The app enabled win32-input-mode (?9001); restored on resume so raw-key encoding is correct before the old scrollback (which holds the startup enable) finishes parsing.
+    public bool Win32Input { get; set; }
 }
 
 // Per-shell metadata stored inside the shell's own folder (shells\<id>\shell.json), written by the window that watches it.
@@ -31,6 +35,8 @@ public sealed class ShellInfo
     public int EnsureOrder { get; set; }
     public long ExitedAtTicks { get; set; }
     public bool Elevated { get; set; }
+    public int ScrollFromBottom { get; set; } = -1;
+    public bool Win32Input { get; set; }
 
     public static ShellInfo? Load(string shellId)
     {
@@ -54,7 +60,7 @@ public sealed class ShellInfo
         try
         {
             Directory.CreateDirectory(AppPaths.ShellDir(info.Id));
-            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated }, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(new ShellInfo { Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated, ScrollFromBottom = info.ScrollFromBottom, Win32Input = info.Win32Input }, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(AppPaths.ShellInfoFile(info.Id), json);
         }
         catch (Exception ex)
@@ -220,7 +226,7 @@ public sealed class WindowState
             {
                 continue;
             }
-            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated });
+            tabs.Add(new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated, ScrollFromBottom = info.ScrollFromBottom, Win32Input = info.Win32Input });
         }
         return tabs;
     }

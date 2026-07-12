@@ -34,9 +34,13 @@ public sealed class TerminalControl : FrameworkElement
     private int _cols;
     private int _rows;
     private TermScreen? _screen;
-    private int _scrollOffset;
+    // Scroll position: either pinned to the bottom (follows live output), or anchored so the top visible row (_scrollTop, a content index) stays put as new output arrives below.
+    private bool _atBottom = true;
+    private int _scrollTop;
     private int _lastFirstAbs;
     private int _lastTotal;
+    // The current scroll position expressed as lines up from the bottom (-1 while pinned) — a form that survives the buffer being rebuilt from the log, so it can be saved per tab and to disk.
+    private int _lastFromBottom = -1;
     private Dictionary<int, List<SearchSpan>>? _searchByLine;
 
     // Filter mode: when set, only these absolute line indices are shown (search matches + their indented children). _rowAbs maps each on-screen row to the absolute line it currently shows (or -1), so selection/hover work in both modes.
@@ -46,7 +50,7 @@ public sealed class TerminalControl : FrameworkElement
     public void SetFilter(List<int>? absLines)
     {
         _filter = absLines is { Count: > 0 } ? absLines : null;
-        _scrollOffset = 0;
+        _atBottom = true;
         RenderFrame();
     }
 
@@ -63,6 +67,27 @@ public sealed class TerminalControl : FrameworkElement
     public TerminalScrollbar? Scrollbar;
     public int ScrollTotal => _lastTotal;
     public int ScrollFirstAbs => _lastFirstAbs;
+
+    // Persistable scroll position: -1 = pinned to the bottom (follows live output), else lines up from the bottom.
+    public int ScrollFromBottom => _lastFromBottom;
+    public void SetScrollFromBottom(int fromBottom)
+    {
+        if (fromBottom < 0)
+        {
+            _atBottom = true;
+        }
+        else if (_screen != null)
+        {
+            lock (_screen.Sync)
+            {
+                int total = _filter is { Count: > 0 } ? _filter.Count : EffectiveTotalLines();
+                int maxFirst = Math.Max(0, total - _rows);
+                _scrollTop = maxFirst - fromBottom;
+                _atBottom = false;
+            }
+        }
+        RenderFrame();
+    }
     // Match ticks map to absolute line indices, which only line up with the scrollbar in the normal (unfiltered) view.
     public IEnumerable<int>? SearchMatchLines => _filter is { Count: > 0 } ? null : _searchByLine?.Keys;
 
@@ -77,8 +102,8 @@ public sealed class TerminalControl : FrameworkElement
         {
             int total = EffectiveTotalLines();
             _lastTotal = total;
-            int firstAbs = (int)Math.Round(frac * total);
-            _scrollOffset = Math.Clamp(total - _rows - firstAbs, 0, Math.Max(0, total - _rows));
+            _scrollTop = (int)Math.Round(frac * total);
+            _atBottom = false;
         }
         RenderFrame();
     }
@@ -116,10 +141,10 @@ public sealed class TerminalControl : FrameworkElement
         Unloaded += (_, _) => _blinkTimer.Stop();
     }
 
+    // Scroll state is restored by the caller (per-tab) right after attaching, so this does not reset the position.
     public void Attach(TermScreen screen)
     {
         _screen = screen;
-        _scrollOffset = 0;
         _searchByLine = null;
         _filter = null;
         ClearSelection();
@@ -138,15 +163,26 @@ public sealed class TerminalControl : FrameworkElement
 
     public void ScrollToBottom()
     {
-        _scrollOffset = 0;
+        _atBottom = true;
         RenderFrame();
     }
 
-    // Scroll by whole lines (positive = up into scrollback); clamped in RenderFrame.
+    // Scroll by whole lines (positive = up into scrollback). Anchors the top row; RenderFrame re-pins to the bottom if you scroll all the way down.
     public void ScrollByLines(int lines)
     {
-        _scrollOffset += lines;
+        _scrollTop = _lastFirstAbs - lines;
+        _atBottom = false;
         RenderFrame();
+    }
+
+    // When older history is prepended (its line indices all shift down by delta), keep a scrolled-up view on the same content.
+    public void ShiftScrollAnchor(int delta)
+    {
+        if (!_atBottom && delta != 0)
+        {
+            _scrollTop += delta;
+            RenderFrame();
+        }
     }
 
     // Page up/down keeps one row of overlap for continuity.
@@ -177,7 +213,8 @@ public sealed class TerminalControl : FrameworkElement
                 total = EffectiveTotalLines();
                 pos = absLine;
             }
-            _scrollOffset = Math.Clamp(total - _rows - (pos - _rows / 2), 0, Math.Max(0, total - _rows));
+            _scrollTop = pos - _rows / 2;
+            _atBottom = false;
         }
         RenderFrame();
     }
@@ -254,10 +291,25 @@ public sealed class TerminalControl : FrameworkElement
             // Filter mode shows only a chosen subset of lines (search matches and their indented children); the "content" is then the filter list rather than the contiguous buffer.
             bool filtered = _filter is { Count: > 0 };
             int total = filtered ? _filter!.Count : EffectiveTotalLines();
-            _scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, total - _rows));
-            int first = total - _rows - _scrollOffset;
+            int maxFirst = Math.Max(0, total - _rows);
+            int first;
+            if (_atBottom)
+            {
+                first = maxFirst;
+            }
+            else
+            {
+                first = Math.Clamp(_scrollTop, 0, maxFirst);
+                _scrollTop = first;
+                // Scrolled all the way down → re-pin so live output follows again.
+                if (first >= maxFirst)
+                {
+                    _atBottom = true;
+                }
+            }
             _lastFirstAbs = first;
             _lastTotal = total;
+            _lastFromBottom = _atBottom ? -1 : maxFirst - first;
             if (_rowAbs.Length != _rows)
             {
                 _rowAbs = new int[_rows];
@@ -286,7 +338,7 @@ public sealed class TerminalControl : FrameworkElement
                     DrawCell(r, c, line.Cells[c], spans, IsSelected(abs, c), IsHoveredLink(abs, c));
                 }
             }
-            if (!filtered && ShowTermCursor && _scrollOffset == 0 && _screen.CursorVisible)
+            if (!filtered && ShowTermCursor && _atBottom && _screen.CursorVisible)
             {
                 // A moving cursor resets the blink phase to visible so it never disappears mid-typing.
                 var cursorPos = (cursorAbs, _screen.CursorX);
@@ -457,8 +509,7 @@ public sealed class TerminalControl : FrameworkElement
     protected override void OnMouseWheel(MouseWheelEventArgs e)
     {
         base.OnMouseWheel(e);
-        _scrollOffset += e.Delta / WheelDeltaPerNotch * ScrollLinesPerNotch;
-        RenderFrame();
+        ScrollByLines(e.Delta / WheelDeltaPerNotch * ScrollLinesPerNotch);
         e.Handled = true;
     }
 
