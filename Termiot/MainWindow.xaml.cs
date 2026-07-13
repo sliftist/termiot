@@ -49,6 +49,11 @@ public partial class MainWindow : Window
         public string PendingInput = "";
         public string LastCommand = "";
         public CommandHistory History = null!;
+        // Per-tab search/filter, so switching tabs restores each tab's own search instead of carrying one query across all of them.
+        public string SearchQuery = "";
+        public bool SearchOpen;
+        public bool SearchFilter;
+        public int SearchMatchIndex = -1;
         // Raw-keys mode has no input box, so the current line is reconstructed from keystrokes to feed history: printable text accumulates, Backspace pops, plain Enter commits. Tainted (paste, navigation/edit keys, or over the keystroke cap) → the line is not stored.
         public readonly System.Text.StringBuilder RawHistoryLine = new();
         public int RawHistoryKeys;
@@ -149,6 +154,8 @@ public partial class MainWindow : Window
     private const int LlmMaxOutputChars = 3000;
     private const int LlmMaxOutputLines = 40;
     private bool _settingInputText;
+    // Set while restoring a tab's search state so the SearchBox/FilterToggle change handlers don't recompute mid-restore.
+    private bool _restoringSearch;
     private bool _closedBecauseEmpty;
     // Set once the window starts closing so the async restore (and its staggered follow-ups) stop creating tabs on a window that's going away.
     private bool _closing;
@@ -1643,10 +1650,11 @@ public partial class MainWindow : Window
         {
             return;
         }
-        // Remember the outgoing tab's scroll position so switching back restores it instead of jumping.
+        // Remember the outgoing tab's scroll position and search so switching back restores them instead of jumping / carrying the query across.
         if (Active is { } outgoing)
         {
             outgoing.Info.ScrollFromBottom = Term.ScrollFromBottom;
+            SaveSearchState(outgoing);
         }
         _active = index;
         var vm = _tabs[index];
@@ -1665,10 +1673,7 @@ public partial class MainWindow : Window
         UpdateWindowTitle();
         UpdateScrollStats();
         RefreshTabHeaders();
-        if (SearchBar.Visibility == Visibility.Visible)
-        {
-            RecomputeSearch();
-        }
+        RestoreSearchState(vm);
         FocusInput();
         ScheduleSave();
     }
@@ -2188,6 +2193,11 @@ public partial class MainWindow : Window
             SearchBar.Visibility = Visibility.Visible;
             SearchBox.Focus();
             SearchBox.SelectAll();
+            // Reopening a tab whose box still holds a query should show its matches again, not wait for an edit.
+            if (SearchBox.Text.Length > 0)
+            {
+                RecomputeSearch();
+            }
         }
         else if (Bound("new-window"))
         {
@@ -2318,7 +2328,10 @@ public partial class MainWindow : Window
             {
                 e.Handled = true;
                 session.SendInput(encoded);
-                Term.ScrollToBottom();
+                if (!IsModifierKey(key))
+                {
+                    Term.ScrollToBottom();
+                }
             }
         }
     }
@@ -3025,6 +3038,10 @@ public partial class MainWindow : Window
         }
     }
 
+    // Bare modifier keys (Ctrl/Shift/Alt/Win pressed alone) are still forwarded in win32-input-mode, but must not scroll the view — otherwise holding Ctrl to Ctrl-click jumps the terminal to the bottom.
+    private static bool IsModifierKey(Key key) =>
+        key is Key.LeftCtrl or Key.RightCtrl or Key.LeftShift or Key.RightShift or Key.LeftAlt or Key.RightAlt or Key.System or Key.LWin or Key.RWin;
+
     // --- raw keystroke mode ---
 
     // A REPL line typed in raw mode is any run of plain typing ended by a plain Enter. We rebuild it from keystrokes so it can go into history; a keystroke count over this cap (a long message, or a program the user is driving rather than typing a command into) drops the line instead.
@@ -3093,7 +3110,10 @@ public partial class MainWindow : Window
             e.Handled = true;
             session.SendInput(encoded);
             LogRawKeystroke(System.Text.Encoding.UTF8.GetString(encoded));
-            Term.ScrollToBottom();
+            if (!IsModifierKey(key))
+            {
+                Term.ScrollToBottom();
+            }
             bool noEditMods = (Keyboard.Modifiers & (ModifierKeys.Control | ModifierKeys.Alt | ModifierKeys.Shift)) == 0;
             if (key == Key.Enter && noEditMods)
             {
@@ -3134,7 +3154,45 @@ public partial class MainWindow : Window
 
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
     {
+        if (_restoringSearch)
+        {
+            return;
+        }
         RecomputeSearch();
+    }
+
+    // Snapshot the live search UI onto the tab being left.
+    private void SaveSearchState(TabVm vm)
+    {
+        vm.SearchOpen = SearchBar.Visibility == Visibility.Visible;
+        vm.SearchQuery = SearchBox.Text;
+        vm.SearchFilter = FilterToggle.IsChecked == true;
+        vm.SearchMatchIndex = _matchIndex;
+    }
+
+    // Bring the search UI to what the tab being entered had; recompute against its own buffer.
+    private void RestoreSearchState(TabVm vm)
+    {
+        _restoringSearch = true;
+        SearchBox.Text = vm.SearchQuery;
+        FilterToggle.IsChecked = vm.SearchFilter;
+        SearchBar.Visibility = vm.SearchOpen ? Visibility.Visible : Visibility.Collapsed;
+        _restoringSearch = false;
+        if (!vm.SearchOpen)
+        {
+            _matches = new List<(int, int)>();
+            _matchIndex = -1;
+            Term.SetSearchResults(null);
+            Term.SetFilter(null);
+            return;
+        }
+        RecomputeSearch();
+        // RecomputeSearch parks on the last match; put the caret back on the match the tab was left at.
+        if (vm.SearchMatchIndex >= 0 && vm.SearchMatchIndex < _matches.Count)
+        {
+            _matchIndex = vm.SearchMatchIndex;
+            ApplySearch();
+        }
     }
 
     private void RecomputeSearch()
@@ -3197,7 +3255,7 @@ public partial class MainWindow : Window
 
     private void FilterToggle_Changed(object sender, RoutedEventArgs e)
     {
-        if (!_uiReady)
+        if (!_uiReady || _restoringSearch)
         {
             return;
         }
@@ -3293,6 +3351,13 @@ public partial class MainWindow : Window
         FilterToggle.IsChecked = false;
         Term.SetSearchResults(null);
         Term.SetFilter(null);
+        // Closing search is per-tab: don't let this tab reopen it on the next switch back.
+        if (Active is { } vm)
+        {
+            vm.SearchOpen = false;
+            vm.SearchFilter = false;
+            vm.SearchMatchIndex = -1;
+        }
         FocusInput();
     }
 
