@@ -98,6 +98,12 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _syncTimer;
     private List<(int Line, int Col)> _matches = new();
     private int _matchIndex = -1;
+    // Incremental search: committed (scrollback) matches are scanned once and kept here; only newly-committed lines and the volatile live screen are rescanned as output arrives. _searchScanned is the scrollback count already folded in; _searchDropped detects cap trimming (which shifts indices, forcing a full rescan).
+    private List<(int Line, int Col)> _stableMatches = new();
+    private int _searchScanned;
+    private long _searchDropped;
+    private long _lastSearchUpdateTicks;
+    private const int SearchUpdateThrottleMs = 100;
     private const int YarnNamesCacheMs = 5000;
     // Regular candidates are recomputed at most this often after typing stops, off the UI thread, so directory enumeration never blocks keystrokes.
     private const int CandDebounceMs = 50;
@@ -609,6 +615,11 @@ public partial class MainWindow : Window
                 if (vm == Active)
                 {
                     Term.ShiftScrollAnchor(delta);
+                    // Prepend invalidates the incremental search cache's absolute indices — rescan from scratch.
+                    if (SearchBar.Visibility == Visibility.Visible)
+                    {
+                        RecomputeSearch();
+                    }
                 }
             });
         };
@@ -1759,6 +1770,11 @@ public partial class MainWindow : Window
             if (vm == Active && !vm.Replaying)
             {
                 Term.RenderFrame();
+                // New output may add matches; re-scan (throttled) so search stays live instead of frozen at the term's first scan.
+                if (SearchBar.Visibility == Visibility.Visible)
+                {
+                    UpdateSearchForNewOutput();
+                }
             }
             if (!_tracedFirstRender)
             {
@@ -1860,9 +1876,20 @@ public partial class MainWindow : Window
             IsChecked = vm.Info.Elevated,
         };
         admin.Click += (_, _) => SetElevated(vm, admin.IsChecked);
+        var clearHistory = new MenuItem { Header = "Clear command history" };
+        clearHistory.Click += (_, _) =>
+        {
+            vm.History.Clear();
+            if (vm == Active)
+            {
+                _histIndex = -1;
+                RefreshCandidates();
+            }
+        };
         menu.Items.Add(escapes);
         menu.Items.Add(rename);
         menu.Items.Add(admin);
+        menu.Items.Add(clearHistory);
         menu.IsOpen = true;
     }
 
@@ -3195,38 +3222,108 @@ public partial class MainWindow : Window
         }
     }
 
+    // Full rescan (query changed, tab switched, scrollback prepended): throw away the incremental cache and scan from scratch.
     private void RecomputeSearch()
     {
-        var vm = Active;
-        string query = SearchBox.Text;
-        _matches = new List<(int, int)>();
-        if (vm != null && query.Length > 0)
-        {
-            lock (vm.Screen.Sync)
-            {
-                int total = vm.Screen.TotalLines;
-                for (int i = 0; i < total; i++)
-                {
-                    var text = vm.Screen.GetLine(i).GetText();
-                    int from = 0;
-                    while (true)
-                    {
-                        int at = text.IndexOf(query, from, StringComparison.OrdinalIgnoreCase);
-                        if (at < 0)
-                        {
-                            break;
-                        }
-                        _matches.Add((i, at));
-                        from = at + Math.Max(1, query.Length);
-                    }
-                }
-            }
-        }
+        _stableMatches = new List<(int, int)>();
+        _searchScanned = 0;
+        _searchDropped = Active?.Screen.DroppedLines ?? 0;
+        ScanSearch();
         _matchIndex = _matches.Count - 1;
         ApplySearch();
     }
 
-    private void ApplySearch()
+    // Rebuild _matches: fold newly-committed scrollback lines into the stable set once, then rescan the volatile live screen each time. Cap trimming (DroppedLines changed) shifts indices, so start over then.
+    private void ScanSearch()
+    {
+        var vm = Active;
+        string query = SearchBox.Text;
+        if (vm == null || query.Length == 0)
+        {
+            _stableMatches = new List<(int, int)>();
+            _searchScanned = 0;
+            _matches = new List<(int, int)>();
+            return;
+        }
+        lock (vm.Screen.Sync)
+        {
+            if (vm.Screen.DroppedLines != _searchDropped)
+            {
+                _searchDropped = vm.Screen.DroppedLines;
+                _stableMatches = new List<(int, int)>();
+                _searchScanned = 0;
+            }
+            int scrollback = vm.Screen.ScrollbackCount;
+            int total = vm.Screen.TotalLines;
+            for (int i = _searchScanned; i < scrollback; i++)
+            {
+                AddLineMatches(vm.Screen.GetLine(i).GetText(), i, query, _stableMatches);
+            }
+            _searchScanned = Math.Max(_searchScanned, scrollback);
+            var combined = new List<(int, int)>(_stableMatches);
+            for (int i = scrollback; i < total; i++)
+            {
+                AddLineMatches(vm.Screen.GetLine(i).GetText(), i, query, combined);
+            }
+            _matches = combined;
+        }
+    }
+
+    private static void AddLineMatches(string text, int line, string query, List<(int Line, int Col)> into)
+    {
+        int from = 0;
+        while (true)
+        {
+            int at = text.IndexOf(query, from, StringComparison.OrdinalIgnoreCase);
+            if (at < 0)
+            {
+                break;
+            }
+            into.Add((line, at));
+            from = at + Math.Max(1, query.Length);
+        }
+    }
+
+    // Called from the render tick when the active tab produced output and search is open: re-scan cheaply and reflect new matches. If the caret sat on the very last match, it follows the newest one; otherwise it stays put (by identity) and the view doesn't move.
+    private void UpdateSearchForNewOutput()
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastSearchUpdateTicks < SearchUpdateThrottleMs)
+        {
+            return;
+        }
+        _lastSearchUpdateTicks = now;
+        var prev = _matches;
+        bool wasOnLast = _matchIndex >= 0 && _matchIndex == prev.Count - 1;
+        (int, int)? current = _matchIndex >= 0 && _matchIndex < prev.Count ? prev[_matchIndex] : null;
+        ScanSearch();
+        bool changed = _matches.Count != prev.Count || (_matches.Count > 0 && !_matches[^1].Equals(prev[^1]));
+        if (!changed)
+        {
+            return;
+        }
+        if (_matches.Count == 0)
+        {
+            _matchIndex = -1;
+        }
+        else if (wasOnLast)
+        {
+            _matchIndex = _matches.Count - 1;
+        }
+        else if (current is { } c)
+        {
+            int idx = _matches.IndexOf(c);
+            _matchIndex = idx >= 0 ? idx : Math.Clamp(_matchIndex, 0, _matches.Count - 1);
+        }
+        else
+        {
+            _matchIndex = _matches.Count - 1;
+        }
+        // Only follow the view when auto-advancing to the newest match; a passive highlight refresh must not yank the user's scroll.
+        ApplySearch(scroll: wasOnLast && _matches.Count > 0);
+    }
+
+    private void ApplySearch(bool scroll = true)
     {
         if (_matches.Count == 0)
         {
@@ -3250,7 +3347,10 @@ public partial class MainWindow : Window
         SearchCount.Text = $"{_matchIndex + 1}/{_matches.Count}";
         Term.SetSearchResults(byLine);
         BuildFilter();
-        Term.ScrollToAbsLine(_matches[_matchIndex].Line);
+        if (scroll && _matchIndex >= 0)
+        {
+            Term.ScrollToAbsLine(_matches[_matchIndex].Line);
+        }
     }
 
     private void FilterToggle_Changed(object sender, RoutedEventArgs e)
@@ -3329,15 +3429,36 @@ public partial class MainWindow : Window
         if (e.Key == Key.Enter && _matches.Count > 0)
         {
             e.Handled = true;
-            bool backwards = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
-            _matchIndex = ((_matchIndex + (backwards ? -1 : 1)) % _matches.Count + _matches.Count) % _matches.Count;
-            ApplySearch();
+            StepMatch((Keyboard.Modifiers & ModifierKeys.Shift) != 0);
         }
         else if (e.Key == Key.Escape)
         {
             e.Handled = true;
             CloseSearch();
         }
+    }
+
+    // Step to the previous (up) or next (down) match and re-apply, keeping focus in the search box so keyboard navigation continues.
+    private void StepMatch(bool backwards)
+    {
+        if (_matches.Count == 0)
+        {
+            return;
+        }
+        _matchIndex = ((_matchIndex + (backwards ? -1 : 1)) % _matches.Count + _matches.Count) % _matches.Count;
+        ApplySearch();
+    }
+
+    private void SearchPrev_Click(object sender, RoutedEventArgs e)
+    {
+        StepMatch(true);
+        SearchBox.Focus();
+    }
+
+    private void SearchNext_Click(object sender, RoutedEventArgs e)
+    {
+        StepMatch(false);
+        SearchBox.Focus();
     }
 
     private void SearchClose_Click(object sender, RoutedEventArgs e)

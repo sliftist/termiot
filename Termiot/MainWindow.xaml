@@ -90,6 +90,8 @@
       <Border x:Name="SearchBar" Visibility="Collapsed" HorizontalAlignment="Right" VerticalAlignment="Top" Background="#FF2D2D2D" BorderBrush="#FF555555" BorderThickness="1" Margin="0,4,20,0" Padding="6,4">
         <StackPanel Orientation="Horizontal">
           <TextBox x:Name="SearchBox" Width="240" Background="#FF1E1E1E" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontFamily="Consolas" FontSize="13" TextChanged="SearchBox_TextChanged" PreviewKeyDown="SearchBox_PreviewKeyDown" />
+          <Button x:Name="SearchPrevBtn" Content="↑" Click="SearchPrev_Click" Margin="6,0,0,0" Padding="6,0" VerticalAlignment="Center" Background="Transparent" Foreground="#FF999999" BorderThickness="0" FontSize="13" ToolTip="Search up — previous match (Shift+Enter)" />
+          <Button x:Name="SearchNextBtn" Content="↓" Click="SearchNext_Click" Margin="2,0,0,0" Padding="6,0" VerticalAlignment="Center" Background="Transparent" Foreground="#FF999999" BorderThickness="0" FontSize="13" ToolTip="Search down — next match (Enter)" />
           <ToggleButton x:Name="FilterToggle" Content="filter" Margin="6,0,0,0" Padding="8,1" VerticalAlignment="Center" FontSize="12" Foreground="#FFCCCCCC"
                         ToolTip="Filter: show only matching lines and the lines indented under them"
                         Checked="FilterToggle_Changed" Unchecked="FilterToggle_Changed">
@@ -103,14 +105,14 @@
                     <Setter TargetName="bd" Property="Background" Value="#FF3A3A3A" />
                   </Trigger>
                   <Trigger Property="IsChecked" Value="True">
-                    <!-- Toggled on: darker, inset (top-shadow gradient), accent text. -->
-                    <Setter Property="Foreground" Value="#FF6FA8DC" />
-                    <Setter TargetName="bd" Property="BorderBrush" Value="#FF2A2A2A" />
+                    <!-- Toggled on: green text, border, and tint so it's unmistakably active. -->
+                    <Setter Property="Foreground" Value="#FF7FD47F" />
+                    <Setter TargetName="bd" Property="BorderBrush" Value="#FF4E8C4E" />
                     <Setter TargetName="bd" Property="Background">
                       <Setter.Value>
                         <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-                          <GradientStop Color="#FF0B0B0B" Offset="0" />
-                          <GradientStop Color="#FF181818" Offset="1" />
+                          <GradientStop Color="#FF14301C" Offset="0" />
+                          <GradientStop Color="#FF1C4026" Offset="1" />
                         </LinearGradientBrush>
                       </Setter.Value>
                     </Setter>

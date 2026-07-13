@@ -532,7 +532,7 @@ public sealed class TerminalControl : FrameworkElement
             return "";
         }
         var (a, b) = OrderedSelection();
-        var lines = new List<string>();
+        var sb = new StringBuilder();
         lock (_screen.Sync)
         {
             int last = Math.Min(b.Line, _screen.TotalLines - 1);
@@ -541,10 +541,18 @@ public sealed class TerminalControl : FrameworkElement
                 var text = _screen.GetLine(line).GetText();
                 int start = line == a.Line ? Math.Min(a.Col, text.Length) : 0;
                 int end = line == b.Line ? Math.Min(b.Col + 1, text.Length) : text.Length;
-                lines.Add(start < end ? text.Substring(start, end - start) : "");
+                if (start < end)
+                {
+                    sb.Append(text, start, end - start);
+                }
+                // A line written edge-to-edge wrapped into the next — that's a visual break, not a real newline, so don't insert one.
+                if (line < last && !LineIsFull(line))
+                {
+                    sb.Append("\r\n");
+                }
             }
         }
-        return string.Join("\r\n", lines);
+        return sb.ToString();
     }
 
     private ((int Line, int Col) A, (int Line, int Col) B) OrderedSelection()
@@ -689,12 +697,90 @@ public sealed class TerminalControl : FrameworkElement
         }
         if (e.ChangedButton == MouseButton.Left && _screen != null)
         {
+            var cell = CellAt(e.GetPosition(this));
+            if (e.ClickCount == 2)
+            {
+                // Double-click selects the word under the cursor.
+                SelectWordAt(cell);
+                e.Handled = true;
+                return;
+            }
+            if (e.ClickCount >= 3)
+            {
+                // Triple-click selects the whole logical line (spanning wrapped rows).
+                SelectLogicalLineAt(cell);
+                e.Handled = true;
+                return;
+            }
             _hasSelection = false;
             _selecting = true;
-            _selAnchor = _selEnd = CellAt(e.GetPosition(this));
+            _selAnchor = _selEnd = cell;
             CaptureMouse();
             RenderFrame();
         }
+    }
+
+    // A word is letters, digits, and underscore — punctuation (periods, slashes, etc.) is not part of a word.
+    private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+    private void SelectWordAt((int Line, int Col) cell)
+    {
+        string text;
+        int line;
+        lock (_screen!.Sync)
+        {
+            line = Math.Clamp(cell.Line, 0, Math.Max(0, _screen.TotalLines - 1));
+            text = _screen.GetLine(line).GetText();
+        }
+        int col = cell.Col;
+        if (col >= text.Length || !IsWordChar(text[col]))
+        {
+            _hasSelection = false;
+            _selecting = false;
+            RenderFrame();
+            return;
+        }
+        int start = col;
+        while (start > 0 && IsWordChar(text[start - 1]))
+        {
+            start--;
+        }
+        int end = col;
+        while (end + 1 < text.Length && IsWordChar(text[end + 1]))
+        {
+            end++;
+        }
+        _selAnchor = (line, start);
+        _selEnd = (line, end);
+        _hasSelection = true;
+        _selecting = false;
+        RenderFrame();
+    }
+
+    private void SelectLogicalLineAt((int Line, int Col) cell)
+    {
+        lock (_screen!.Sync)
+        {
+            int total = _screen.TotalLines;
+            int line = Math.Clamp(cell.Line, 0, Math.Max(0, total - 1));
+            // A logical line is the run of rows joined by wrap (each full-width row continues into the next).
+            int first = line;
+            while (first > 0 && LineIsFull(first - 1))
+            {
+                first--;
+            }
+            int last = line;
+            while (last < total - 1 && LineIsFull(last))
+            {
+                last++;
+            }
+            int endLen = _screen.GetLine(last).GetText().Length;
+            _selAnchor = (first, 0);
+            _selEnd = (last, Math.Max(0, endLen - 1));
+        }
+        _hasSelection = true;
+        _selecting = false;
+        RenderFrame();
     }
 
     protected override void OnMouseUp(MouseButtonEventArgs e)

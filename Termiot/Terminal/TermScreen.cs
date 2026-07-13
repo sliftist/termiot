@@ -40,6 +40,8 @@ public sealed class TermScreen
     public bool OnAltScreen => _mainSaved != null;
     public int ScrollbackCount => _scrollback.Count;
     public int TotalLines => _scrollback.Count + _rows;
+    // Total lines ever dropped off the front of scrollback (cap trimming). Absolute line indices shift down when this grows, so incremental consumers (search) rescan when it changes.
+    public long DroppedLines { get; private set; }
 
     // Approximate character count of the whole buffer: sum of each line's cell array length (scrollback lines are trimmed of trailing blanks, so this tracks real content). O(lines), cheap; caller must hold Sync.
     public long TotalChars()
@@ -230,7 +232,9 @@ public sealed class TermScreen
         _scrollback.Add(line);
         if (_scrollback.Count > ScrollbackCap + ScrollbackTrimChunk)
         {
-            _scrollback.RemoveRange(0, _scrollback.Count - ScrollbackCap);
+            int removed = _scrollback.Count - ScrollbackCap;
+            _scrollback.RemoveRange(0, removed);
+            DroppedLines += removed;
         }
     }
 
