@@ -43,6 +43,8 @@ public partial class MainWindow : Window
         public long LastOutputTicks;
         public int Dirty;
         public bool Win32Input;
+        // Per-tab: raw-keys mode (keystrokes go straight to the shell instead of the editor input box).
+        public bool RawKeys;
         // Runtime: the connected host reported it's running elevated (drives the admin badge). Distinct from Info.Elevated, which is the sticky preference.
         public bool Elevated;
         public bool LoggedFirstRender;
@@ -107,6 +109,8 @@ public partial class MainWindow : Window
     private const int YarnNamesCacheMs = 5000;
     // Regular candidates are recomputed at most this often after typing stops, off the UI thread, so directory enumeration never blocks keystrokes.
     private const int CandDebounceMs = 50;
+    // Upper bound on filesystem completions from one directory — keeps a huge directory from flooding the candidate list and the UI-thread merge.
+    private const int MaxFsCandidates = 500;
 
     private string _yarnNamesCwd = "";
     private long _yarnNamesTick;
@@ -349,6 +353,9 @@ public partial class MainWindow : Window
             }
             _settingsWindow?.Close();
             LastActiveWindow.Remove(_windowId);
+            // State writes are queued off-thread; force them out synchronously now so nothing is lost if the process exits next.
+            StateWriter.Flush();
+            AppLog.Flush();
             // Timers must not outlive the window — the dispatcher may keep running (takeover teardown).
             _saveTimer.Stop();
             _renderTimer.Stop();
@@ -413,7 +420,7 @@ public partial class MainWindow : Window
                 }
                 entries.Add(new RestoreEntry
                 {
-                    Info = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks },
+                    Info = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated, ScrollFromBottom = info.ScrollFromBottom, Win32Input = info.Win32Input, RawKeys = info.RawKeys },
                     Alive = alive,
                     // A shell that never ran (no host.json) is a fresh seed, not a terminated session — start it outright instead of asking to resume.
                     EverRan = File.Exists(AppPaths.HostInfoFile(id)),
@@ -515,18 +522,21 @@ public partial class MainWindow : Window
 
     private TabVm? Active => _active >= 0 && _active < _tabs.Count ? _tabs[_active] : null;
 
-    private bool RawMode => RawToggle.IsChecked.GetValueOrDefault();
+    // Raw-keys mode is per tab; the toggle just mirrors the active tab's state.
+    private bool RawMode => Active?.RawKeys ?? false;
+    private bool _settingRawToggle;
 
-    private static TabInfo NewTabInfo(string cwd)
+    private TabInfo NewTabInfo(string cwd)
     {
-        return new TabInfo { Id = Program.NewShellId(), Cwd = cwd, Title = DefaultTabTitle };
+        // New tabs start in whatever raw-keys mode the user last chose (per-tab thereafter).
+        return new TabInfo { Id = Program.NewShellId(), Cwd = cwd, Title = DefaultTabTitle, RawKeys = _settings.RawInput };
     }
 
     private TabVm CreateTab(TabInfo info, bool activate, bool start = true, bool insertAfterActive = false, int insertIndex = -1)
     {
         var screen = new TermScreen(120, 30) { ScrollbackCap = _settings.ScrollbackLines };
         var parser = new VtParser(screen) { ShowEscapes = _settings.ShowEscapeSequences };
-        var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput, Win32Input = info.Win32Input, History = new CommandHistory(AppPaths.ShellHistoryFile(info.Id)) };
+        var vm = new TabVm { Info = info, Screen = screen, Parser = parser, PendingInput = info.PendingInput, Win32Input = info.Win32Input, RawKeys = info.RawKeys, History = new CommandHistory(AppPaths.ShellHistoryFile(info.Id)) };
         // Just record the latest title; the render tick applies it (see RenderDirtyTabs). Dispatching per sequence floods the UI thread — a heavy replay carries thousands of title changes.
         parser.OnTitle = title =>
         {
@@ -1062,15 +1072,12 @@ public partial class MainWindow : Window
             ToolTip = "Running as administrator",
         };
         vm.AdminBadge = adminBadge;
-        // Indicator only: the shell has enabled win32-input-mode (an icon rather than title text — titles are too cramped for it).
+        // win32-input-mode indicator: always shown so the state is visible (blue = on, dim = off). The color/tooltip are set in RefreshTabTitle from the effective state.
         var win32Badge = new TextBlock
         {
             Text = "⌨",
-            Foreground = new SolidColorBrush(Color.FromRgb(0x6F, 0xA8, 0xDC)),
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(6, 0, 0, 0),
-            Visibility = Visibility.Collapsed,
-            ToolTip = "win32-input-mode — full keyboard fidelity (Ctrl+Enter, Shift+Enter, Alt chords)",
         };
         vm.Win32Badge = win32Badge;
         // Indicator only — shows that this shell will auto-resume via AUTORESUME.cmd (tooltip shows the command); deliberately not clickable.
@@ -1130,6 +1137,8 @@ public partial class MainWindow : Window
             Padding = new Thickness(12, 2, 10, 2),
             Cursor = Cursors.Hand,
             Background = Brushes.Transparent,
+            // Reserved on every tab (transparent when inactive) so the active tab's accent underline doesn't change its height.
+            BorderThickness = new Thickness(0, 0, 0, 2),
         };
         border.MouseLeftButtonDown += (_, e) =>
         {
@@ -1470,8 +1479,10 @@ public partial class MainWindow : Window
         for (int i = 0; i < _tabs.Count; i++)
         {
             var vm = _tabs[i];
-            // Dark theme: the selected tab goes DARKER (pure black, merging with the terminal below), not lighter; inactive tabs alternate two shades so their boundaries are visible.
-            vm.Header.Background = vm == Active ? Brushes.Black : (i % 2 == 0 ? Brushes.Transparent : new SolidColorBrush(Color.FromRgb(0x2C, 0x2C, 0x2C)));
+            bool active = vm == Active;
+            // The focused tab gets an orange fill with a brighter orange underline so it's unmistakable; inactive tabs alternate two dark shades so their boundaries are visible.
+            vm.Header.Background = active ? new SolidColorBrush(Color.FromRgb(0x5A, 0x38, 0x14)) : (i % 2 == 0 ? Brushes.Transparent : new SolidColorBrush(Color.FromRgb(0x2C, 0x2C, 0x2C)));
+            vm.Header.BorderBrush = active ? new SolidColorBrush(Color.FromRgb(0xFF, 0xB0, 0x40)) : Brushes.Transparent;
         }
         RelayoutTabRows();
     }
@@ -1672,6 +1683,11 @@ public partial class MainWindow : Window
         Term.ShowTermCursor = RawMode && !vm.Dead && vm.Session != null;
         Term.Attach(vm.Screen);
         Term.SetScrollFromBottom(vm.Info.ScrollFromBottom);
+        // Reflect this tab's own raw-keys mode and apply the editor/raw layout for it.
+        _settingRawToggle = true;
+        RawToggle.IsChecked = vm.RawKeys;
+        _settingRawToggle = false;
+        ApplyInputMode();
         // Switching to a tab loads its older history now rather than waiting for the delayed pass (its recent tail is already on screen from the file read).
         vm.Session?.Activate();
         CwdLabel.Text = vm.Info.Cwd;
@@ -1876,21 +1892,59 @@ public partial class MainWindow : Window
             IsChecked = vm.Info.Elevated,
         };
         admin.Click += (_, _) => SetElevated(vm, admin.IsChecked);
-        var clearHistory = new MenuItem { Header = "Clear command history" };
-        clearHistory.Click += (_, _) =>
-        {
-            vm.History.Clear();
-            if (vm == Active)
-            {
-                _histIndex = -1;
-                RefreshCandidates();
-            }
-        };
+        var clearConsole = new MenuItem { Header = "Clear console history" };
+        clearConsole.Click += (_, _) => ClearConsoleHistory(vm);
         menu.Items.Add(escapes);
         menu.Items.Add(rename);
         menu.Items.Add(admin);
-        menu.Items.Add(clearHistory);
+        menu.Items.Add(clearConsole);
         menu.IsOpen = true;
+    }
+
+    // Wipe the scrolled-back output for a tab: clear the client's in-memory scrollback and tell the host to truncate the log files so it doesn't come back on resume. The current on-screen prompt/output stays.
+    private void ClearConsoleHistory(TabVm vm)
+    {
+        lock (vm.Screen.Sync)
+        {
+            vm.Screen.ClearScrollback();
+        }
+        vm.CommandMarks.Clear();
+        if (!vm.Dead && vm.Session is { } session)
+        {
+            // Live: the host owns the log files — let it truncate them.
+            session.ClearLog();
+        }
+        else
+        {
+            // Dead tab: no host, so truncate the log ourselves (off the UI thread).
+            string logPath = AppPaths.LogFile(vm.Info.Id);
+            string prevPath = AppPaths.PrevLogFile(vm.Info.Id);
+            Task.Run(() =>
+            {
+                try
+                {
+                    File.WriteAllBytes(logPath, Array.Empty<byte>());
+                    if (File.Exists(prevPath))
+                    {
+                        File.Delete(prevPath);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Write("ui", "clear dead-tab log failed: " + ex.Message);
+                }
+            });
+        }
+        if (vm == Active)
+        {
+            Term.ScrollToBottom();
+            Term.RenderFrame();
+            if (SearchBar.Visibility == Visibility.Visible)
+            {
+                RecomputeSearch();
+            }
+            UpdateScrollStats();
+        }
     }
 
     // Toggle the sticky elevated preference and restart the shell so the new host is (or isn't) elevated. Elevating prompts UAC; the renderer stays unelevated.
@@ -1900,6 +1954,9 @@ public partial class MainWindow : Window
         ShellInfo.Save(vm.Info);
         RestartShell(vm);
     }
+
+    // Effective win32-input-mode for a tab: the global setting forces it on for every tab; otherwise it follows what the app requested (auto).
+    private bool Win32Active(TabVm vm) => _settings.AlwaysWin32Input || vm.Win32Input;
 
     private void StartTitleEdit(TabVm vm)
     {
@@ -1939,7 +1996,12 @@ public partial class MainWindow : Window
 
     private void RefreshTabTitle(TabVm vm)
     {
-        vm.Win32Badge.Visibility = vm.Win32Input ? Visibility.Visible : Visibility.Collapsed;
+        // Always visible: bright when win32-input-mode is active, dim when off, so the state is unmistakable.
+        bool win32 = Win32Active(vm);
+        vm.Win32Badge.Foreground = new SolidColorBrush(win32 ? Color.FromRgb(0x6F, 0xA8, 0xDC) : Color.FromRgb(0x55, 0x55, 0x55));
+        vm.Win32Badge.ToolTip = win32
+            ? "win32-input-mode: ON — full keyboard fidelity (Ctrl+Enter, Shift+Enter, Alt chords)."
+            : "win32-input-mode: OFF — legacy VT input.";
         vm.AdminBadge.Visibility = vm.Elevated ? Visibility.Visible : Visibility.Collapsed;
         var text = vm.HeaderText;
         text.Inlines.Clear();
@@ -2103,7 +2165,7 @@ public partial class MainWindow : Window
                     continue;
                 }
                 var info = ShellInfo.Load(id) ?? new ShellInfo();
-                var tabInfo = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks };
+                var tabInfo = new TabInfo { Id = id, Cwd = info.Cwd, Title = info.Title, ForcedTitle = info.ForcedTitle, PendingInput = info.PendingInput, EnsureOrder = info.EnsureOrder, ExitedAtTicks = info.ExitedAtTicks, Elevated = info.Elevated, ScrollFromBottom = info.ScrollFromBottom, Win32Input = info.Win32Input, RawKeys = info.RawKeys };
                 result.Add((tabInfo, HostInfo.IsShellAlive(id)));
             }
         }
@@ -2328,7 +2390,7 @@ public partial class MainWindow : Window
                     var text = Clipboard.GetText();
                     if (text.Length > 0)
                     {
-                        if (pasteVm.Win32Input)
+                        if (Win32Active(pasteVm))
                         {
                             pasteSession.SendInput(InputEncoder.EncodeWin32Text(text));
                         }
@@ -2350,7 +2412,7 @@ public partial class MainWindow : Window
         }
         else if (!RawMode && !SearchBox.IsKeyboardFocused && ShouldForwardToShell(key, Keyboard.Modifiers) && !IsInputEditingChord(key, Keyboard.Modifiers) && Active is { Dead: false, Session: { } session } forwardVm)
         {
-            var encoded = forwardVm.Win32Input ? InputEncoder.EncodeWin32Key(key, Keyboard.Modifiers) : InputEncoder.Encode(key, Keyboard.Modifiers);
+            var encoded = Win32Active(forwardVm) ? InputEncoder.EncodeWin32Key(key, Keyboard.Modifiers) : InputEncoder.Encode(key, Keyboard.Modifiers);
             if (encoded != null)
             {
                 e.Handled = true;
@@ -2438,12 +2500,19 @@ public partial class MainWindow : Window
 
     private void RawToggle_Changed(object sender, RoutedEventArgs e)
     {
-        if (!_uiReady)
+        if (!_uiReady || _settingRawToggle)
         {
             return;
         }
-        _settings.RawInput = RawMode;
-        _settings.Save();
+        if (Active is { } vm)
+        {
+            vm.RawKeys = RawToggle.IsChecked.GetValueOrDefault();
+            vm.Info.RawKeys = vm.RawKeys;
+            ShellInfo.Save(vm.Info);
+            // Remembered as the default for newly created tabs.
+            _settings.RawInput = vm.RawKeys;
+            _settings.Save();
+        }
         ApplyInputMode();
         FocusInput();
     }
@@ -2582,7 +2651,7 @@ public partial class MainWindow : Window
                     {
                         session.SendCommandMarker(text.Trim());
                     }
-                    if (vm.Win32Input)
+                    if (Win32Active(vm))
                     {
                         // TUI apps with paste detection (Claude) treat one burst ending in \r as a paste containing a newline, not a submit. Send the text, then a genuine Enter key record after a beat so it reads as its own keypress.
                         if (text.Length > 0)
@@ -2667,20 +2736,20 @@ public partial class MainWindow : Window
     // Tab / Down move forward through the suggestion list, Shift+Tab / Up move back; the visible window of rows rolls along with the selection, and one step past the ends restores what the user had typed.
     private void CycleCandidates(bool backwards)
     {
-        if (!UseLlmFor(InputBox.Text) && (_candidates.Count == 0 || _candText != InputBox.Text))
+        // Re-derive the basis only when starting a fresh walk (not already stepping). Through a whole Up/Down cycle the basis text and candidate list stay fixed — each step swaps the box's text to a candidate, and re-deriving from that would recompute against the completion instead of what the user typed, breaking the walk. Only a manual edit or running the command re-bases (both reset _candIndex to -1).
+        if (_candIndex == -1)
         {
-            // The background result may not have landed (or is for older input) — compute synchronously for this deliberate Tab press.
-            _candidates = BuildTabCandidates(InputBox.Text);
-            _candText = InputBox.Text;
-            _candWindowStart = 0;
+            _candBase = InputBox.Text;
+            if (!UseLlmFor(_candBase) && _candText != _candBase)
+            {
+                // Candidates for this text aren't ready yet — compute off the UI thread (never block on directory I/O). This press does nothing; once they land the next Tab walks them.
+                ComputeRegularCandidatesAsync();
+                return;
+            }
         }
         if (_candidates.Count == 0)
         {
             return;
-        }
-        if (_candIndex == -1)
-        {
-            _candBase = InputBox.Text;
         }
         int slots = _candidates.Count + 1;
         int current = _candIndex == -1 ? _candidates.Count : _candIndex;
@@ -2751,6 +2820,7 @@ public partial class MainWindow : Window
                 FontSize = 13,
                 Padding = new Thickness(2, 1, 2, 1),
                 TextTrimming = TextTrimming.CharacterEllipsis,
+                TextWrapping = TextWrapping.NoWrap,
             };
             _suggestionRows.Add(row);
             SuggestionPanel.Children.Add(row);
@@ -2775,7 +2845,8 @@ public partial class MainWindow : Window
         {
             var row = _suggestionRows[i];
             int index = _candWindowStart + i;
-            row.Text = index < _candidates.Count ? _candidates[index] : " ";
+            // Collapse newlines to a marker so a multi-line candidate stays one row — otherwise the panel grows and the whole UI shifts as you type. The real (multi-line) value is still what gets inserted on select.
+            row.Text = index < _candidates.Count ? _candidates[index].Replace("\r\n", " ⏎ ").Replace('\n', '⏎').Replace('\r', ' ') : " ";
             bool selected = _candIndex == index && _candIndex >= 0;
             row.Background = selected ? new SolidColorBrush(Color.FromRgb(0x2A, 0x2A, 0x2A)) : Brushes.Transparent;
             row.Foreground = new SolidColorBrush(selected ? Color.FromRgb(0xE8, 0xE8, 0xE8) : Color.FromRgb(0x8A, 0x8A, 0x8A));
@@ -2913,13 +2984,6 @@ public partial class MainWindow : Window
         });
     }
 
-    // Regular (non-LLM) candidates: history commands matching the whole input first, then yarn scripts when applicable, then entries of the current directory whose name starts with the last space-separated token. Synchronous — used as the Tab fallback when the async result isn't ready.
-    private List<string> BuildTabCandidates(string text)
-    {
-        var history = text.Length > 0 && Active is { } vm ? HistoryCandidates(text, vm) : new List<string>();
-        return CombineCandidates(history, FsAndYarnCandidates(text, Active?.Info.Cwd ?? ""));
-    }
-
     private static List<string> CombineCandidates(List<string> history, List<string> fs)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -2977,10 +3041,12 @@ public partial class MainWindow : Window
         try
         {
             string dir = Path.IsPathRooted(dirPart) ? dirPart : Path.Combine(cwd, dirPart);
+            // Cap the list — an empty token in a huge directory would otherwise return tens of thousands of entries and slow the UI-thread merge; nobody cycles through that many completions.
             var names = Directory.GetFileSystemEntries(dir)
                 .Select(e => Path.GetFileName(e) + (Directory.Exists(e) ? "\\" : ""))
                 .Where(n => n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase);
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .Take(MaxFsCandidates);
             foreach (var name in names)
             {
                 var candidate = head + dirPart + name;
@@ -3131,7 +3197,7 @@ public partial class MainWindow : Window
             return;
         }
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
-        var encoded = vm.Win32Input ? InputEncoder.EncodeWin32Key(key, Keyboard.Modifiers) : InputEncoder.Encode(key, Keyboard.Modifiers);
+        var encoded = Win32Active(vm) ? InputEncoder.EncodeWin32Key(key, Keyboard.Modifiers) : InputEncoder.Encode(key, Keyboard.Modifiers);
         if (encoded != null)
         {
             e.Handled = true;
@@ -3163,7 +3229,7 @@ public partial class MainWindow : Window
         {
             return;
         }
-        if (vm.Win32Input)
+        if (Win32Active(vm))
         {
             session.SendInput(InputEncoder.EncodeWin32Text(e.Text));
         }
@@ -3535,6 +3601,8 @@ public partial class MainWindow : Window
                 fast.ArgumentList.Add(_windowId);
                 fast.ArgumentList.Add("--resume");
                 fast.ArgumentList.Add("--takeover");
+                // The takeover child reads this window's saved state — flush the async writes first.
+                StateWriter.Flush();
                 Process.Start(fast);
             }
             catch (Exception ex)
@@ -3544,6 +3612,8 @@ public partial class MainWindow : Window
             return;
         }
         SaveState();
+        // The build script spawns a takeover process that reads this window's state; make sure it's on disk.
+        StateWriter.Flush();
         SetReloadBuilding(true);
         StartReloadBuild();
     }
@@ -3685,6 +3755,8 @@ public partial class MainWindow : Window
         {
             tab.Screen.ScrollbackCap = _settings.ScrollbackLines;
             tab.ResourceRow.Visibility = _settings.ShowTabResources ? Visibility.Visible : Visibility.Collapsed;
+            // The win32-input badge reflects the effective (setting-aware) state — refresh it in case AlwaysWin32Input changed.
+            RefreshTabTitle(tab);
         }
         RelayoutTabRows();
     }

@@ -21,6 +21,8 @@ public static class PipeProtocol
     public const byte MsgReplayRecent = 12;
     // Host → client, once on connect: payload[0] = 1 if the host process is elevated (running as administrator).
     public const byte MsgHostElevated = 13;
+    // Client → host: truncate the log files (clear the saved console history) so scrollback doesn't come back on resume. Live output continues.
+    public const byte MsgClearLog = 14;
 
     // A malformed or hostile peer can put anything in the length field; cap it so we drop the connection instead of attempting a huge allocation.
     public const int MaxFrameBytes = 16 * 1024 * 1024;

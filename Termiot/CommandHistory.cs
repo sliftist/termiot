@@ -80,28 +80,6 @@ public sealed class CommandHistory
         });
     }
 
-    // Forget every remembered command for this shell and remove the backing file (recreated on the next Add).
-    public void Clear()
-    {
-        lock (_gate)
-        {
-            _entries.Clear();
-        }
-        Task.Run(() =>
-        {
-            lock (_gate)
-            {
-                try
-                {
-                    File.Delete(_file);
-                }
-                catch
-                {
-                }
-            }
-        });
-    }
-
     // Most recent first, distinct; prefix "" matches everything so up-arrow on an empty box walks plain history.
     public List<string> Match(string prefix)
     {

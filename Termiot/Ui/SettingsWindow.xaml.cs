@@ -40,6 +40,7 @@ public partial class SettingsWindow : Window
         ReopenOnStartupBox.IsChecked = settings.ReopenOnStartup;
         ShowTabResourcesBox.IsChecked = settings.ShowTabResources;
         SingleRowTabsBox.IsChecked = settings.SingleRowTabs;
+        AlwaysWin32InputBox.IsChecked = settings.AlwaysWin32Input;
         SwapEnterBox.IsChecked = settings.SwapEnterSubmit;
         ShowFpsBox.IsChecked = settings.ShowFps;
         ConfigPathBox.Text = settings.OpenRouterConfigPath;
@@ -326,6 +327,17 @@ public partial class SettingsWindow : Window
             return;
         }
         _settings.ShowFps = ShowFpsBox.IsChecked.GetValueOrDefault();
+        _settings.Save();
+        _onChanged();
+    }
+
+    private void AlwaysWin32InputBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_loaded)
+        {
+            return;
+        }
+        _settings.AlwaysWin32Input = AlwaysWin32InputBox.IsChecked.GetValueOrDefault();
         _settings.Save();
         _onChanged();
     }

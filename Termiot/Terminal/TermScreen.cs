@@ -90,6 +90,8 @@ public sealed class TermScreen
         if (_pendingWrap)
         {
             _pendingWrap = false;
+            // This line filled to the edge and flows onto the next — mark it so copy doesn't insert a newline here.
+            _lines[_y].Wrapped = true;
             _x = 0;
             LineFeed();
         }
@@ -115,6 +117,7 @@ public sealed class TermScreen
             {
                 FlushRun();
                 _pendingWrap = false;
+                _lines[_y].Wrapped = true;
                 _x = 0;
                 LineFeed();
             }
@@ -224,6 +227,17 @@ public sealed class TermScreen
             }
             _lines[_marginTop] = new TermLine(_cols, Blank);
         }
+    }
+
+    // Drop all scrolled-back lines (the on-screen rows stay). Counts as dropped lines so index-based consumers (search) rescan.
+    public void ClearScrollback()
+    {
+        if (_scrollback.Count == 0)
+        {
+            return;
+        }
+        DroppedLines += _scrollback.Count;
+        _scrollback.Clear();
     }
 
     private void PushScrollback(TermLine line)

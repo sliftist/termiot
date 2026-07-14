@@ -477,6 +477,8 @@ public static class Program
 
     public static void SpawnWindowProcess(string windowId, bool resume = false)
     {
+        // The child reads window/shell state on startup — make sure any queued async writes are on disk first.
+        StateWriter.Flush();
         try
         {
             var psi = new ProcessStartInfo(Environment.ProcessPath!)

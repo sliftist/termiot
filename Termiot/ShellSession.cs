@@ -502,6 +502,12 @@ public sealed class ShellSession : IDisposable
         Enqueue(PipeProtocol.MsgInput, bytes);
     }
 
+    // Ask the host to truncate its log files so cleared scrollback doesn't reappear on resume.
+    public void ClearLog()
+    {
+        Enqueue(PipeProtocol.MsgClearLog, Array.Empty<byte>());
+    }
+
     public void Resize(int cols, int rows)
     {
         _pendingCols = cols;

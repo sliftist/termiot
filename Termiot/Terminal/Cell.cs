@@ -30,6 +30,8 @@ public sealed class TermLine
 {
     public Cell[] Cells;
     public List<LineAnnotation>? Annotations;
+    // True when this line ran off the right edge and continued onto the next (auto-wrap) rather than ending at a real newline. Survives trimming and the push to scrollback, so copy/link-join can tell a wrapped logical line from separate lines.
+    public bool Wrapped;
 
     public TermLine(int cols, Cell blank)
     {

@@ -15,6 +15,8 @@ public sealed class AppSettings
     public bool ShowFps { get; set; }
     public bool SingleRowTabs { get; set; }
     public bool SwapEnterSubmit { get; set; }
+    // On: always send win32 input records (full keyboard fidelity, never lost across resume/restart). Off: auto — only when the app requests win32-input-mode (?9001), as it originally worked.
+    public bool AlwaysWin32Input { get; set; } = true;
     // Hotkey overrides only (id → gesture); defaults live in Hotkeys.All.
     public Dictionary<string, string> Hotkeys { get; set; } = new();
 
@@ -51,7 +53,7 @@ public sealed class AppSettings
     {
         try
         {
-            File.WriteAllText(AppPaths.SettingsFile, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+            StateWriter.Write(AppPaths.SettingsFile, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch
         {

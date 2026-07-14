@@ -29,9 +29,9 @@ public static class LastActiveWindow
     {
         try
         {
-            Directory.CreateDirectory(Dir);
+            // Fires on every window activation, so keep it off the UI thread — StateWriter creates the dir and coalesces.
             using var self = System.Diagnostics.Process.GetCurrentProcess();
-            File.WriteAllText(RecordPath(windowId), JsonSerializer.Serialize(new Record
+            StateWriter.Write(RecordPath(windowId), JsonSerializer.Serialize(new Record
             {
                 Pid = self.Id,
                 StartTicks = self.StartTime.Ticks,
@@ -49,7 +49,7 @@ public static class LastActiveWindow
     {
         try
         {
-            File.Delete(RecordPath(windowId));
+            StateWriter.Delete(RecordPath(windowId));
         }
         catch
         {

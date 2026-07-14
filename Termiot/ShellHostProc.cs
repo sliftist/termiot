@@ -225,6 +225,9 @@ public static class ShellHostProc
                     var marker = Encoding.UTF8.GetBytes("\x1b_termiot-cmd:" + Convert.ToBase64String(f.Payload) + "\x1b\\");
                     Broadcast(marker, marker.Length);
                     break;
+                case PipeProtocol.MsgClearLog:
+                    ClearLogFiles();
+                    break;
                 case PipeProtocol.MsgDetach:
                     return;
                 case PipeProtocol.MsgShutdown:
@@ -462,6 +465,28 @@ public static class ShellHostProc
             lock (IoLock)
             {
                 FlushLogLocked();
+            }
+        }
+    }
+
+    // Clear saved console history: drop unflushed output, empty the active log, and remove the rotated previous log. Live output keeps flowing and appends to the now-empty log.
+    private static void ClearLogFiles()
+    {
+        lock (IoLock)
+        {
+            try
+            {
+                PendingLog.SetLength(0);
+                File.WriteAllBytes(_logPath, Array.Empty<byte>());
+                if (File.Exists(_prevLogPath))
+                {
+                    File.Delete(_prevLogPath);
+                }
+                _activeLen = 0;
+            }
+            catch (Exception ex)
+            {
+                AppLog.Write("shellhost", "clear log failed: " + ex.Message);
             }
         }
     }

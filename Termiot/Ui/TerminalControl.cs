@@ -23,7 +23,7 @@ public sealed class TerminalControl : FrameworkElement
     // SGR 2 (dim/faint): the foreground is pulled this far toward the background.
     private const int DimAlpha = 130;
     private const int CursorBlinkMs = 530;
-    private static readonly Regex UrlRegex = new(@"https?://[^\s""'<>\)\]]+", RegexOptions.Compiled);
+    private static readonly Regex UrlRegex = new(@"(?:https?|ftps?|file)://[^\s""'<>\)\]]+", RegexOptions.Compiled);
 
     private GlyphAtlas? _atlas;
     private double _dpiScale = 1.0;
@@ -545,10 +545,10 @@ public sealed class TerminalControl : FrameworkElement
                 {
                     sb.Append(text, start, end - start);
                 }
-                // A line written edge-to-edge wrapped into the next — that's a visual break, not a real newline, so don't insert one.
-                if (line < last && !LineIsFull(line))
+                // Insert a newline between real lines, but not where a line auto-wrapped onto the next (that's a visual break, not a real newline).
+                if (line < last && !LineWraps(line))
                 {
-                    sb.Append("\r\n");
+                    sb.Append('\n');
                 }
             }
         }
@@ -627,12 +627,12 @@ public sealed class TerminalControl : FrameworkElement
                 return null;
             }
             int first = line;
-            while (first > 0 && line - first < MaxWrapJoinLines && LineIsFull(first - 1))
+            while (first > 0 && line - first < MaxWrapJoinLines && LineWraps(first - 1))
             {
                 first--;
             }
             int last = line;
-            while (last < total - 1 && last - line < MaxWrapJoinLines && LineIsFull(last))
+            while (last < total - 1 && last - line < MaxWrapJoinLines && LineWraps(last))
             {
                 last++;
             }
@@ -672,11 +672,8 @@ public sealed class TerminalControl : FrameworkElement
         return null;
     }
 
-    private bool LineIsFull(int line)
-    {
-        var cells = _screen!.GetLine(line);
-        return cells.Cells.Length > 0 && cells.GetText().Length == cells.Cells.Length;
-    }
+    // Whether this line continues onto the next without a real newline (auto-wrap) — the accurate per-line flag, not the old "is it full width" guess (which was always true for trimmed scrollback lines).
+    private bool LineWraps(int line) => _screen!.GetLine(line).Wrapped;
 
     protected override void OnMouseDown(MouseButtonEventArgs e)
     {
@@ -765,12 +762,12 @@ public sealed class TerminalControl : FrameworkElement
             int line = Math.Clamp(cell.Line, 0, Math.Max(0, total - 1));
             // A logical line is the run of rows joined by wrap (each full-width row continues into the next).
             int first = line;
-            while (first > 0 && LineIsFull(first - 1))
+            while (first > 0 && LineWraps(first - 1))
             {
                 first--;
             }
             int last = line;
-            while (last < total - 1 && LineIsFull(last))
+            while (last < total - 1 && LineWraps(last))
             {
                 last++;
             }
