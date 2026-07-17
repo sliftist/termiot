@@ -9,31 +9,27 @@
   <DockPanel>
     <Border x:Name="TabBar" DockPanel.Dock="Top" Background="#FF141414">
       <Grid>
-        <StackPanel x:Name="TabBarRows">
-          <DockPanel x:Name="TopRowDock">
-            <!-- The window chrome (name, readouts, settings/reload) shares a slightly darker panel so its bounds are visible against the tab strip. -->
-            <Border x:Name="ChromePanel" DockPanel.Dock="Right" Background="#FF0D0D0D" MouseEnter="ChromePanel_MouseEnter" MouseLeave="ChromePanel_MouseLeave">
-              <StackPanel Orientation="Horizontal">
-                <!-- Reserves no width until the window is named; a faint "name" hint appears only on chrome hover or focus, so an unnamed window shows no blank gap. -->
-                <Grid VerticalAlignment="Center">
-                  <TextBlock x:Name="WindowNamePlaceholder" Text="name" Foreground="#FF5A5A5A" FontSize="11" VerticalAlignment="Center" Margin="8,0,0,0" IsHitTestVisible="False" Visibility="Collapsed" />
-                  <TextBox x:Name="WindowNameBox" MinWidth="0" HorizontalAlignment="Stretch" VerticalAlignment="Center" Margin="6,0,0,0" Background="Transparent" Foreground="#FF9A9AC8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontSize="11" TextChanged="WindowNameBox_TextChanged" GotKeyboardFocus="WindowNameBox_FocusChanged" LostKeyboardFocus="WindowNameBox_FocusChanged" ToolTip="Window name — targetable from launches via --ensure --window &lt;name&gt;" />
-                </Grid>
-                <!-- Fixed width + right alignment: the readout changes every second, so a content-sized box would reflow the window name and tab strip on each tick. -->
-                <TextBlock x:Name="FpsText" Width="90" TextAlignment="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0,0,0" ToolTip="Painted frames last second (output-driven; idle is 0) · average cost of one full render · the fps that cost could sustain" />
-                <TextBlock x:Name="BuildTimeText" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
-                <Button x:Name="SettingsBtn" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
-                <Button x:Name="ReloadBtn" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones). Shift+Click: reload onto the newest existing build without rebuilding." />
-              </StackPanel>
-            </Border>
-            <Button x:Name="NewTabBtn" DockPanel.Dock="Right" Content="+" Click="NewTabBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="16" Visibility="Collapsed" />
-            <Button x:Name="ScrollRightBtn" DockPanel.Dock="Right" Content="▶" Click="ScrollRightBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
-            <Button x:Name="ScrollLeftBtn" DockPanel.Dock="Left" Content="◀" Click="ScrollLeftBtn_Click" Width="20" Background="Transparent" Foreground="#FF666666" BorderThickness="0" FontSize="10" Visibility="Collapsed" />
-            <ScrollViewer x:Name="TabScroller" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" PreviewMouseWheel="TabScroller_PreviewMouseWheel" ScrollChanged="TabScroller_ScrollChanged">
-              <StackPanel x:Name="TabStrip" Orientation="Horizontal" HorizontalAlignment="Left" />
-            </ScrollViewer>
-          </DockPanel>
-        </StackPanel>
+        <!-- All tabs flow through the masonry (two-lane packing: short tabs fill the gap beside tall ones). It reserves the top-right for the chrome overlay below. -->
+        <ui:TabMasonryPanel x:Name="TabMasonry" />
+        <!-- Single-row mode only: horizontal scroller, shown instead of the masonry. -->
+        <ScrollViewer x:Name="TabScroller" HorizontalAlignment="Left" VerticalAlignment="Top" Visibility="Collapsed" HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Disabled" PreviewMouseWheel="TabScroller_PreviewMouseWheel" ScrollChanged="TabScroller_ScrollChanged">
+          <StackPanel x:Name="TabStrip" Orientation="Horizontal" HorizontalAlignment="Left" />
+        </ScrollViewer>
+        <!-- The window chrome (name, readouts, settings/reload) overlays the top-right; the tab area flows around it. -->
+        <Border x:Name="ChromePanel" HorizontalAlignment="Right" VerticalAlignment="Top" Background="#FF0D0D0D" MouseEnter="ChromePanel_MouseEnter" MouseLeave="ChromePanel_MouseLeave">
+          <StackPanel Orientation="Horizontal">
+            <!-- Reserves no width until the window is named; a faint "name" hint appears only on chrome hover or focus, so an unnamed window shows no blank gap. -->
+            <Grid VerticalAlignment="Center">
+              <TextBlock x:Name="WindowNamePlaceholder" Text="name" Foreground="#FF5A5A5A" FontSize="11" VerticalAlignment="Center" Margin="8,0,0,0" IsHitTestVisible="False" Visibility="Collapsed" />
+              <TextBox x:Name="WindowNameBox" MinWidth="0" HorizontalAlignment="Stretch" VerticalAlignment="Center" Margin="6,0,0,0" Background="Transparent" Foreground="#FF9A9AC8" CaretBrush="#FFE8E8E8" BorderThickness="0" FontSize="11" TextChanged="WindowNameBox_TextChanged" GotKeyboardFocus="WindowNameBox_FocusChanged" LostKeyboardFocus="WindowNameBox_FocusChanged" ToolTip="Window name — targetable from launches via --ensure --window &lt;name&gt;" />
+            </Grid>
+            <!-- Fixed width + right alignment: the readout changes every second, so a content-sized box would reflow the window name and tab strip on each tick. -->
+            <TextBlock x:Name="FpsText" Width="90" TextAlignment="Right" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0,0,0" ToolTip="Painted frames last second (output-driven; idle is 0) · average cost of one full render · the fps that cost could sustain" />
+            <TextBlock x:Name="BuildTimeText" Foreground="#FF777777" FontSize="11" VerticalAlignment="Center" Margin="6,0" />
+            <Button x:Name="SettingsBtn" Content="⚙" Click="SettingsBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" />
+            <Button x:Name="ReloadBtn" Content="⟳" Click="ReloadBtn_Click" Width="30" Background="Transparent" Foreground="#FFAAAAAA" BorderThickness="0" FontSize="14" ToolTip="Rebuild and reload this window (keeps shells, resumes dead ones). Shift+Click: reload onto the newest existing build without rebuilding." />
+          </StackPanel>
+        </Border>
         <Canvas IsHitTestVisible="False">
           <Rectangle x:Name="DropIndicator" Width="3" Fill="#FF4EC94E" Visibility="Collapsed" />
         </Canvas>
@@ -60,7 +56,7 @@
           <Grid>
             <Grid x:Name="EditorArea">
               <!-- The right padding keeps the end-of-line caret from phantom-wrapping onto a second line (which makes the box's height jitter while the caret moves). -->
-              <TextBox x:Name="InputBox" Background="Transparent" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" Padding="0,0,12,0" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" TextWrapping="Wrap" TextChanged="InputBox_TextChanged" PreviewKeyDown="InputBox_PreviewKeyDown" />
+              <TextBox x:Name="InputBox" Background="Transparent" Foreground="#FFE8E8E8" CaretBrush="#FFE8E8E8" BorderThickness="0" Padding="0,0,12,0" FontFamily="Consolas" FontSize="14" VerticalAlignment="Center" TextWrapping="Wrap" AcceptsReturn="True" TextChanged="InputBox_TextChanged" PreviewKeyDown="InputBox_PreviewKeyDown" />
             </Grid>
             <TextBlock x:Name="RawKeysText" Visibility="Collapsed" Foreground="#FF8A8A8A" FontFamily="Consolas" FontSize="13" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
           </Grid>

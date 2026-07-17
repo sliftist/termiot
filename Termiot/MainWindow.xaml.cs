@@ -79,6 +79,8 @@ public partial class MainWindow : Window
         public TextBlock Win32Badge = null!;
         public TextBlock AdminBadge = null!;
         public StackPanel ResourceRow = null!;
+        // Whether the resource bars are currently shown (a tab hides them when all its metrics are trivial vs the heaviest tab, making it shorter and narrower).
+        public bool ResourceRowShown;
         public double StickyHeaderWidth;
         // Width stickiness: when the header last recompacted and how many recompactions landed in quick succession — enough rapid ones pin the width to StickyPinWidth until StickyPinnedUntilTicks, so a title whose width keeps jumping stops reflowing the rows.
         public long StickyLastRecompactTicks;
@@ -331,8 +333,8 @@ public partial class MainWindow : Window
             ScheduleSave();
             RelayoutTabRows();
         };
-        // The scroller's slot shrinks/grows as the top-bar controls (fps, build text, window name) change size; row 0's capacity follows it.
-        TabScroller.SizeChanged += (_, _) => RelayoutTabRows();
+        // The chrome (name, fps, build text) changes width as its contents change; the tab layout reserves its corner, so re-flow when it resizes.
+        ChromePanel.SizeChanged += (_, _) => RelayoutTabRows();
         // Tab adoption between our windows and open-tab-here requests arrive as WM_COPYDATA — a private channel, no OLE drag-drop involved.
         SourceInitialized += (_, _) =>
         {
@@ -929,6 +931,12 @@ public partial class MainWindow : Window
     }
 
     private const double ResourceCellWidth = 56;
+    // A tab shows its resource bars only when some metric passes BOTH a relative bar (this fraction of the heaviest tab's) AND an absolute floor — i.e. threshold = max(fraction·windowMax, floor). Hysteresis (lower bars to keep it shown) stops flicker at the boundary.
+    private const double ResourceShowThreshold = 0.20;
+    private const double ResourceHideThreshold = 0.15;
+    private const double ResourceMemFloorBytes = 100_000_000;
+    private const double ResourceGpuFloorBytes = 50_000_000;
+    private const double ResourceCpuFloorPct = 10;
     // Index order everywhere in the row: VRAM, CPU, memory.
     private static readonly Color[] ResourceBarColors = { Color.FromRgb(0x2E, 0x5B, 0x3A), Color.FromRgb(0x6B, 0x4A, 0x2E), Color.FromRgb(0x2E, 0x4A, 0x6B) };
     private static readonly string[] ResourceTips = { "V: dedicated GPU memory", "C: CPU, averaged over the last minute", "M: memory (working set of the tab's process tree)" };
@@ -936,7 +944,8 @@ public partial class MainWindow : Window
     // One mini bar-gauge per metric: the text sits over a rectangle whose width is the tab's share of the window's per-metric maximum, so the heaviest tab reads at a glance.
     private void BuildResourceRow(TabVm vm)
     {
-        vm.ResourceRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 3), Visibility = _settings.ShowTabResources ? Visibility.Visible : Visibility.Collapsed };
+        // Starts hidden; UpdateResourceRows shows it once the tab's usage is significant relative to the window.
+        vm.ResourceRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 3), Visibility = Visibility.Collapsed };
         vm.ResourceTexts = new TextBlock[3];
         vm.ResourceBars = new System.Windows.Shapes.Rectangle[3];
         for (int i = 0; i < 3; i++)
@@ -966,8 +975,21 @@ public partial class MainWindow : Window
     private void UpdateResourceRows()
     {
         _resources.SetShells(_tabs.Select(t => t.Info.Id));
-        if (!_settings.ShowTabResources || _tabs.Count == 0)
+        if (_tabs.Count == 0)
         {
+            return;
+        }
+        bool layoutChanged = false;
+        if (!_settings.ShowTabResources)
+        {
+            foreach (var vm in _tabs)
+            {
+                layoutChanged |= SetResourceRowShown(vm, false);
+            }
+            if (layoutChanged)
+            {
+                RelayoutTabRows();
+            }
             return;
         }
         var usages = _tabs.Select(t => _resources.Get(t.Info.Id)).ToList();
@@ -982,6 +1004,7 @@ public partial class MainWindow : Window
             {
                 vm.ResourceTexts[0].Text = vm.ResourceTexts[1].Text = vm.ResourceTexts[2].Text = "—";
                 vm.ResourceBars[0].Width = vm.ResourceBars[1].Width = vm.ResourceBars[2].Width = 0;
+                layoutChanged |= SetResourceRowShown(vm, false);
                 continue;
             }
             vm.ResourceTexts[0].Text = "V " + FmtBytes(usage.GpuBytes);
@@ -990,7 +1013,31 @@ public partial class MainWindow : Window
             vm.ResourceBars[0].Width = usage.GpuBytes / maxGpu * ResourceCellWidth;
             vm.ResourceBars[1].Width = usage.CpuPercent / maxCpu * ResourceCellWidth;
             vm.ResourceBars[2].Width = usage.MemoryBytes / maxMem * ResourceCellWidth;
+            // Show when any metric passes both the relative bar and the absolute floor; hysteresis lowers both to keep it shown.
+            double rel = vm.ResourceRowShown ? ResourceHideThreshold : ResourceShowThreshold;
+            double floorScale = vm.ResourceRowShown ? 0.85 : 1.0;
+            bool show =
+                usage.MemoryBytes >= Math.Max(rel * maxMem, ResourceMemFloorBytes * floorScale) ||
+                usage.GpuBytes >= Math.Max(rel * maxGpu, ResourceGpuFloorBytes * floorScale) ||
+                usage.CpuPercent >= Math.Max(rel * maxCpu, ResourceCpuFloorPct * floorScale);
+            layoutChanged |= SetResourceRowShown(vm, show);
         }
+        if (layoutChanged)
+        {
+            RelayoutTabRows();
+        }
+    }
+
+    // Returns true if the visibility actually changed (so the caller reflows the strip).
+    private bool SetResourceRowShown(TabVm vm, bool show)
+    {
+        if (vm.ResourceRowShown == show)
+        {
+            return false;
+        }
+        vm.ResourceRowShown = show;
+        vm.ResourceRow.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+        return true;
     }
 
     private static string FmtBytes(long bytes)
@@ -1496,7 +1543,6 @@ public partial class MainWindow : Window
     private const long StickyPinDurationMs = 20_000;
     // Long enough for a paste-detection window to close, short enough to feel instant.
     private const int Win32EnterDelayMs = 50;
-    private readonly List<StackPanel> _extraRowPanels = new();
     private Button _inlinePlus = null!;
 
     // Measure one header's natural width and fold it through the sticky/pin logic into vm.StickyHeaderWidth. Called while the header is still attached to the tree so Measure actually re-runs; the title width also comes from a direct FormattedText measurement because a TextBlock hands back a stale width after its text shrinks.
@@ -1578,23 +1624,20 @@ public partial class MainWindow : Window
             }
         }
         TabStrip.Children.Clear();
-        foreach (var panel in _extraRowPanels)
-        {
-            panel.Children.Clear();
-        }
+        TabMasonry.Children.Clear();
         if (_inlinePlus.Parent is Panel plusParent)
         {
             plusParent.Children.Remove(_inlinePlus);
         }
-        // The scroller stretches to fill the top bar's remaining slot, so its own width IS row 0's capacity — no estimating around the other controls.
-        double capacity0 = TabScroller.ActualWidth > 0 ? TabScroller.ActualWidth - 2 : 0;
-        // Single-row mode: everything lives in the top scroller and overflow scrolls, exactly the pre-wrap behavior.
-        if (!_settings.SingleRowTabs)
-        {
-            TabScroller.ScrollToHorizontalOffset(0);
-        }
+        // The chrome overlays the top-right; the layout keeps tabs out from under it.
+        double chromeWidth = ChromePanel.ActualWidth;
         if (_settings.SingleRowTabs)
         {
+            // Single-row mode: one scrolling strip, kept left of the chrome.
+            TabMasonry.Visibility = Visibility.Collapsed;
+            TabScroller.Visibility = Visibility.Visible;
+            TabScroller.Margin = new Thickness(0, 0, chromeWidth, 0);
+            TabScroller.ScrollToHorizontalOffset(0);
             foreach (var vm in _tabs)
             {
                 vm.Header.MinWidth = 0;
@@ -1602,62 +1645,17 @@ public partial class MainWindow : Window
                 TabStrip.Children.Add(vm.Header);
             }
             TabStrip.Children.Add(_inlinePlus);
-            while (_extraRowPanels.Count > 0)
-            {
-                TabBarRows.Children.Remove(_extraRowPanels[^1]);
-                _extraRowPanels.RemoveAt(_extraRowPanels.Count - 1);
-            }
             return;
         }
-        double capacityFull = Math.Max(100, TabBarRows.ActualWidth);
-        Panel PanelFor(int r)
-        {
-            while (_extraRowPanels.Count < r)
-            {
-                var panel = new StackPanel { Orientation = Orientation.Horizontal };
-                _extraRowPanels.Add(panel);
-                TabBarRows.Children.Add(panel);
-            }
-            return r == 0 ? TabStrip : _extraRowPanels[r - 1];
-        }
-        double CapacityFor(int r) => r == 0 ? capacity0 : capacityFull;
-        int row = 0;
-        double used = 0;
+        // Multi-row: all tabs flow through the masonry, which packs short tabs into the lanes beside tall ones and reserves the chrome corner.
+        TabScroller.Visibility = Visibility.Collapsed;
+        TabMasonry.Visibility = Visibility.Visible;
+        TabMasonry.ChromeWidth = chromeWidth;
         foreach (var vm in _tabs)
         {
-            var header = vm.Header;
-            double width = vm.StickyHeaderWidth;
-            if (used + width > CapacityFor(row) && PanelFor(row).Children.Count > 0)
-            {
-                row++;
-                used = 0;
-            }
-            PanelFor(row).Children.Add(header);
-            used += width;
+            TabMasonry.Children.Add(vm.Header);
         }
-        // The + trails the last tab, spilling to the next row only if it genuinely doesn't fit.
-        if (used + _inlinePlus.Width > CapacityFor(row) && PanelFor(row).Children.Count > 0)
-        {
-            row++;
-        }
-        PanelFor(row).Children.Add(_inlinePlus);
-        while (_extraRowPanels.Count > row)
-        {
-            TabBarRows.Children.Remove(_extraRowPanels[^1]);
-            _extraRowPanels.RemoveAt(_extraRowPanels.Count - 1);
-        }
-    }
-
-    private const double TabScrollStepPx = 160;
-
-    private void ScrollLeftBtn_Click(object sender, RoutedEventArgs e)
-    {
-        TabScroller.ScrollToHorizontalOffset(TabScroller.HorizontalOffset - TabScrollStepPx);
-    }
-
-    private void ScrollRightBtn_Click(object sender, RoutedEventArgs e)
-    {
-        TabScroller.ScrollToHorizontalOffset(TabScroller.HorizontalOffset + TabScrollStepPx);
+        TabMasonry.Children.Add(_inlinePlus);
     }
 
     private void TabScroller_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
@@ -2639,7 +2637,8 @@ public partial class MainWindow : Window
                     break;
                 }
                 var vm = Active;
-                string text = InputBox.Text;
+                // Normalize pasted line breaks to \n (matching Shift+Enter); a raw \r would read as a submit mid-message in win32 apps like Claude.
+                string text = InputBox.Text.Replace("\r\n", "\n").Replace('\r', '\n');
                 if (vm is { Session: null })
                 {
                     ResumeBtn_Click(sender, e);
@@ -2663,7 +2662,8 @@ public partial class MainWindow : Window
                     }
                     else
                     {
-                        session.SendText(text + "\r");
+                        // Plain shells run one line per carriage return, so a multi-line paste submits each line.
+                        session.SendText(text.Replace('\n', '\r') + "\r");
                     }
                     vm.History.Add(text);
                     if (text.Trim().Length > 0)
@@ -3555,15 +3555,8 @@ public partial class MainWindow : Window
         OpenNewTab();
     }
 
-    // Tight tab strip: the + rides inline right after the last tab, and only when the tabs overflow do the scroll arrows and a fixed always-visible + appear.
     private void TabScroller_ScrollChanged(object sender, System.Windows.Controls.ScrollChangedEventArgs e)
     {
-        // Wrap mode never scrolls — the capacity math guarantees fit, and the chrome must not flicker in on transient layout passes.
-        bool overflow = _settings.SingleRowTabs && TabScroller.ScrollableWidth > 0.5;
-        ScrollLeftBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
-        ScrollRightBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
-        NewTabBtn.Visibility = overflow ? Visibility.Visible : Visibility.Collapsed;
-        _inlinePlus.Visibility = overflow ? Visibility.Collapsed : Visibility.Visible;
     }
 
     // The + button and Ctrl+T are the same action: a new tab in the current tab's directory.
@@ -3754,10 +3747,11 @@ public partial class MainWindow : Window
         foreach (var tab in _tabs)
         {
             tab.Screen.ScrollbackCap = _settings.ScrollbackLines;
-            tab.ResourceRow.Visibility = _settings.ShowTabResources ? Visibility.Visible : Visibility.Collapsed;
             // The win32-input badge reflects the effective (setting-aware) state — refresh it in case AlwaysWin32Input changed.
             RefreshTabTitle(tab);
         }
+        // Resource-row visibility (global toggle + per-tab threshold) is owned by UpdateResourceRows; it reflows if anything changed.
+        UpdateResourceRows();
         RelayoutTabRows();
     }
 
